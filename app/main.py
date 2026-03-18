@@ -16,9 +16,30 @@ from app.queue_bus import RedisStreamBus
 
 app = FastAPI(title="Universal Webhook Middleware (POC)")
 
-# Optional tiny GUI (static). API endpoints stay POST-only.
+# ── Legacy minimal GUI (kept for backward compat) ──────────────────────────────
 # Access: GET /ui/
 app.mount("/ui", StaticFiles(directory="app/static", html=True), name="ui")
+
+# ── New React Admin Console ────────────────────────────────────────────────────
+# Built output: app/static/console/  →  served at /console/
+# SPA catch-all: any /console/* path → index.html (client-side routing)
+import os as _os
+from fastapi.responses import FileResponse as _FileResponse
+
+_CONSOLE_DIR = _os.path.join(_os.path.dirname(__file__), "static", "console")
+
+if _os.path.isdir(_CONSOLE_DIR):
+    app.mount("/console/assets", StaticFiles(directory=_os.path.join(_CONSOLE_DIR, "assets")), name="console-assets")
+
+    @app.get("/console/{full_path:path}", include_in_schema=False)
+    async def serve_console(full_path: str):  # noqa: ARG001
+        index = _os.path.join(_CONSOLE_DIR, "index.html")
+        return _FileResponse(index)
+
+    @app.get("/console", include_in_schema=False)
+    async def serve_console_root():
+        index = _os.path.join(_CONSOLE_DIR, "index.html")
+        return _FileResponse(index)
 
 _TOKEN_PATTERNS = {
     "X-User-Token": [
