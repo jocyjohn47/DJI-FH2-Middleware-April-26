@@ -1,0 +1,268 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Universal Webhook POC – 控制台</title>
+  <style>
+    body{font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial; margin:24px; max-width:1200px;}
+    h1{margin:0 0 8px 0;}
+    h3{margin:0 0 10px;}
+    .muted{color:#666; font-size:13px; line-height:1.45;}
+    .grid{display:grid; grid-template-columns:1fr 1fr; gap:16px; align-items:start;}
+    .card{border:1px solid #e5e7eb; border-radius:10px; padding:14px; background:#fff;}
+    label{display:block; font-size:13px; color:#111827; margin:10px 0 6px;}
+    input, select, textarea, button{font:inherit;}
+    input, select, textarea{width:100%; padding:8px 10px; border:1px solid #d1d5db; border-radius:8px;}
+    textarea{min-height:180px; font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace; font-size:12.5px;}
+    button{padding:9px 12px; border-radius:8px; border:1px solid #111827; background:#111827; color:white; cursor:pointer;}
+    button.secondary{background:white; color:#111827;}
+    .row{display:flex; gap:10px; align-items:center;}
+    .row > *{flex:1;}
+    pre{background:#0b1020; color:#e5e7eb; padding:10px 12px; border-radius:10px; overflow:auto; font-size:12px;}
+    .ok{color:#047857; font-weight:600;}
+    .err{color:#b91c1c; font-weight:600;}
+    .pill{display:inline-block; padding:2px 8px; border-radius:999px; background:#f3f4f6; font-size:12px; margin-left:8px;}
+    hr{border:none;border-top:1px solid #e5e7eb; margin:14px 0;}
+  </style>
+</head>
+<body>
+  <h1>Universal Webhook POC – 控制台 <span class="pill">业务接口 POST-only</span></h1>
+  <div class="muted">
+    目标：多输入源先与<strong>中间件入站鉴权</strong>，通过后才进入队列（沙盒用 Redis Streams 代替 Kafka raw topic）。
+    平台侧可维护每个 <b>source</b> 的：
+    <b>①入站鉴权（中间件 Token）</b> + <b>②FlightHub2 三件套（X-User-Token / x-project-uuid / workflow_uuid）</b>。
+  </div>
+
+  <div class="grid" style="margin-top:16px;">
+
+    <!-- Left: FlightHub config -->
+    <div class="card">
+      <h3>A) FlightHub2 三件套维护（按 source 热更新）</h3>
+      <div class="muted">Worker 每条消息都会按 source 从 Redis 读取配置。Token 刷新/项目关闭/workflow 时效导致失效时，只需在此更新并保存。</div>
+
+      <label>Admin Token（可选，若后端配置了 ADMIN_TOKEN 才需要）</label>
+      <input id="adminToken" placeholder="X-Admin-Token" />
+
+      <div class="row">
+        <div>
+          <label>Source</label>
+          <select id="sourceSel"></select>
+        </div>
+        <div style="flex:0; min-width:200px;">
+          <label>&nbsp;</label>
+          <button class="secondary" onclick="loadSources()">刷新 Source 列表</button>
+        </div>
+      </div>
+
+      <div class="row">
+        <button class="secondary" onclick="loadCfg()">读取（/admin/flighthub/get）</button>
+        <button onclick="saveCfg()">写入（/admin/flighthub/set）</button>
+      </div>
+
+      <label>FlightHub Config JSON</label>
+      <textarea id="cfgJson" spellcheck="false"></textarea>
+
+      <div id="cfgStatus" class="muted" style="margin-top:10px;"></div>
+
+      <hr />
+
+      <h3>C) FlightHub2 三件套提取器（粘贴即可）</h3>
+      <div class="muted">支持粘贴 HTTP headers / curl 命令 / JSON 片段，后端提取后可一键应用到上面的 JSON。</div>
+
+      <label>粘贴原始文本</label>
+      <textarea id="rawPaste" placeholder="例如：\nX-User-Token: xxx\nx-project-uuid: yyy\nworkflow_uuid=zzz\n或 curl -H 'X-User-Token: xxx' ..." spellcheck="false"></textarea>
+
+      <div class="row">
+        <button class="secondary" onclick="extractToken()">提取（/admin/token/extract）</button>
+        <button onclick="applyExtracted()">应用到上方 JSON</button>
+      </div>
+
+      <label>提取结果</label>
+      <pre id="extractOut">{}</pre>
+      <div id="extractStatus" class="muted" style="margin-top:10px;"></div>
+
+    </div>
+
+
+    <!-- Right: inbound source auth -->
+    <div class="card">
+      <h3>B) 中间件入站鉴权（多输入源 → 中间件）</h3>
+      <div class="muted">
+        只有鉴权通过的 webhook 才会进入队列。当前 POC：每个 source 配置一个 <b>static token</b>，由调用方在请求头携带。
+        默认 Header 名：<b>X-MW-Token</b>。
+      </div>
+
+      <label>Admin Token（可选，若后端配置了 ADMIN_TOKEN 才需要）</label>
+      <input id="adminToken2" placeholder="X-Admin-Token" />
+
+      <label>Source</label>
+      <select id="sourceSel2"></select>
+
+      <div class="row">
+        <button class="secondary" onclick="loadSourceAuth()">读取（/admin/source/auth/get）</button>
+        <button onclick="saveSourceAuth()">写入（/admin/source/auth/set）</button>
+      </div>
+
+      <label>入站鉴权配置 JSON</label>
+      <textarea id="srcAuthJson" spellcheck="false"></textarea>
+
+      <div id="srcAuthStatus" class="muted" style="margin-top:10px;"></div>
+
+      <hr />
+
+      <h3>D) 入站鉴权调用示例</h3>
+      <pre>curl -X POST http://127.0.0.1:8000/webhook \
+  -H 'Content-Type: application/json' \
+  -H 'X-MW-Token: &lt;your-source-token&gt;' \
+  -d '{"source":"flighthub2","webhook_event":{...}}'</pre>
+    </div>
+
+  </div>
+
+  <script>
+    const $ = (id)=>document.getElementById(id);
+    let lastExtracted = {};
+
+    function adminHeaders(){
+      const t = $('adminToken').value.trim();
+      return t ? {'X-Admin-Token': t} : {};
+    }
+    function adminHeaders2(){
+      const t = $('adminToken2').value.trim();
+      return t ? {'X-Admin-Token': t} : {};
+    }
+
+    async function postJson(url, body, extraHeaders){
+      const r = await fetch(url, {
+        method:'POST',
+        headers: {'Content-Type':'application/json', ...(extraHeaders||{})},
+        body: JSON.stringify(body || {})
+      });
+      const text = await r.text();
+      let data = null;
+      try{ data = JSON.parse(text); }catch(e){ data = {status:'error', raw:text}; }
+      return {http:r.status, data};
+    }
+
+    async function loadSources(){
+      const {http, data} = await postJson('/admin/source/list', {}, adminHeaders());
+      if(http !== 200 || data.status !== 'ok'){
+        $('cfgStatus').innerHTML = `<span class="err">读取 source 失败</span> http=${http} ${escapeHtml(JSON.stringify(data))}`;
+        return;
+      }
+      const sel1 = $('sourceSel');
+      const sel2 = $('sourceSel2');
+      sel1.innerHTML='';
+      sel2.innerHTML='';
+      (data.sources || ['flighthub2']).forEach(s=>{
+        const o1 = document.createElement('option');
+        o1.value=s; o1.textContent=s;
+        sel1.appendChild(o1);
+        const o2 = document.createElement('option');
+        o2.value=s; o2.textContent=s;
+        sel2.appendChild(o2);
+      });
+      $('cfgStatus').innerHTML = `<span class="ok">已加载 ${data.sources.length} 个 source</span>`;
+    }
+
+    async function loadCfg(){
+      const source = $('sourceSel').value || 'flighthub2';
+      const {http, data} = await postJson('/admin/flighthub/get', {source}, adminHeaders());
+      if(http !== 200 || data.status !== 'ok'){
+        $('cfgStatus').innerHTML = `<span class="err">读取失败</span> http=${http} ${escapeHtml(JSON.stringify(data))}`;
+        return;
+      }
+      $('cfgJson').value = JSON.stringify(data.config || {}, null, 2);
+      $('cfgStatus').innerHTML = `<span class="ok">读取成功</span>（X-User-Token 会脱敏回显）`;
+    }
+
+    async function saveCfg(){
+      const source = $('sourceSel').value || 'flighthub2';
+      let cfg = null;
+      try{ cfg = JSON.parse($('cfgJson').value || '{}'); }
+      catch(e){
+        $('cfgStatus').innerHTML = `<span class="err">JSON 解析失败</span>：${escapeHtml(e.toString())}`;
+        return;
+      }
+      const {http, data} = await postJson('/admin/flighthub/set', {source, config: cfg}, adminHeaders());
+      if(http !== 200 || data.status !== 'ok'){
+        $('cfgStatus').innerHTML = `<span class="err">写入失败</span> http=${http} ${escapeHtml(JSON.stringify(data))}`;
+        return;
+      }
+      $('cfgStatus').innerHTML = `<span class="ok">写入成功</span>（该 source 后续推送立即使用新三件套）`;
+    }
+
+    async function extractToken(){
+      const raw = $('rawPaste').value || '';
+      const {http, data} = await postJson('/admin/token/extract', {raw}, adminHeaders());
+      if(http !== 200 || data.status !== 'ok'){
+        $('extractStatus').innerHTML = `<span class="err">提取失败</span> http=${http} ${escapeHtml(JSON.stringify(data))}`;
+        return;
+      }
+      lastExtracted = data.extracted || {};
+      $('extractOut').textContent = JSON.stringify(lastExtracted, null, 2);
+      $('extractStatus').innerHTML = `<span class="ok">提取完成</span>`;
+    }
+
+    function applyExtracted(){
+      if(!lastExtracted || Object.keys(lastExtracted).length === 0){
+        $('extractStatus').innerHTML = `<span class="err">没有可应用的提取结果</span>`;
+        return;
+      }
+      let cfg = {};
+      try{ cfg = JSON.parse($('cfgJson').value || '{}'); }catch(e){ cfg = {}; }
+      cfg.headers = cfg.headers || {};
+      if(lastExtracted['X-User-Token']) cfg.headers['X-User-Token'] = lastExtracted['X-User-Token'];
+      if(lastExtracted['x-project-uuid']) cfg.headers['x-project-uuid'] = lastExtracted['x-project-uuid'];
+      if(lastExtracted['workflow_uuid']){
+        cfg.template_body = cfg.template_body || {};
+        cfg.template_body['workflow_uuid'] = lastExtracted['workflow_uuid'];
+      }
+      $('cfgJson').value = JSON.stringify(cfg, null, 2);
+      $('extractStatus').innerHTML = `<span class="ok">已应用</span>（请点击“写入”保存）`;
+    }
+
+    async function loadSourceAuth(){
+      const source = $('sourceSel2').value || 'flighthub2';
+      const {http, data} = await postJson('/admin/source/auth/get', {source}, adminHeaders2());
+      if(http !== 200 || data.status !== 'ok'){
+        $('srcAuthStatus').innerHTML = `<span class="err">读取失败</span> http=${http} ${escapeHtml(JSON.stringify(data))}`;
+        return;
+      }
+      $('srcAuthJson').value = JSON.stringify(data.auth || {}, null, 2);
+      $('srcAuthStatus').innerHTML = `<span class="ok">读取成功</span>（token 会脱敏回显）`;
+    }
+
+    async function saveSourceAuth(){
+      const source = $('sourceSel2').value || 'flighthub2';
+      let auth = null;
+      try{ auth = JSON.parse($('srcAuthJson').value || '{}'); }
+      catch(e){
+        $('srcAuthStatus').innerHTML = `<span class="err">JSON 解析失败</span>：${escapeHtml(e.toString())}`;
+        return;
+      }
+      const {http, data} = await postJson('/admin/source/auth/set', {source, auth}, adminHeaders2());
+      if(http !== 200 || data.status !== 'ok'){
+        $('srcAuthStatus').innerHTML = `<span class="err">写入失败</span> http=${http} ${escapeHtml(JSON.stringify(data))}`;
+        return;
+      }
+      $('srcAuthStatus').innerHTML = `<span class="ok">写入成功</span>（该 source 后续 webhook 将按新入站鉴权放行/拒绝）`;
+    }
+
+    function escapeHtml(s){
+      return (s||'').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;');
+    }
+
+    // auto init
+    loadSources().catch(()=>{});
+    $('cfgJson').value = JSON.stringify({
+      endpoint: 'https://es-flight-api-us.djigate.com/openapi/v0.1/workflow',
+      headers: { 'Content-Type':'application/json', 'X-User-Token':'', 'x-project-uuid':'' },
+      template_body: { workflow_uuid:'', trigger_type:0, name:'Alert-{{timestamp}}', params:{ creator:'{{creator_id}}', latitude:'{{latitude}}', longitude:'{{longitude}}', level:'{{level}}', desc:'{{description}}' } },
+      retry_policy: { max_retries:3, backoff:'exponential' }
+    }, null, 2);
+    $('srcAuthJson').value = JSON.stringify({enabled:true, mode:'static_token', header_name:'X-MW-Token', token:''}, null, 2);
+  </script>
+</body>
+</html>
