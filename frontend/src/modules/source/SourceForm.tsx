@@ -1,6 +1,6 @@
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import { useForm } from 'react-hook-form'
-import { useMutation, useQueryClient } from '@tanstack/react-query'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { sourceService, authService } from '@/services'
 import { useUIStore, useSourceStore } from '@/store'
 import { Card } from '@/components/ui/Card'
@@ -66,28 +66,55 @@ interface AuthFormFields {
 export function SourceAuthForm({ sourceId }: { sourceId: string }) {
   const { addToast } = useUIStore()
   const [showToken, setShowToken] = useState(false)
-  const { register, handleSubmit, setValue, watch, formState: { errors } } = useForm<AuthFormFields>({
+  const { register, handleSubmit, setValue, watch, reset, formState: { errors } } = useForm<AuthFormFields>({
     defaultValues: { enabled: true, header_name: 'X-MW-Token', token: '' },
   })
 
   const tokenValue = watch('token')
 
+  // ── 加载已有配置（只填 header_name 和 enabled；token 后端已脱敏，留空让用户主动输入）
+  const { data: existingAuth } = useQuery({
+    queryKey: ['auth', sourceId],
+    queryFn: () => authService.get(sourceId),
+    enabled: !!sourceId,
+  })
+
+  useEffect(() => {
+    if (existingAuth) {
+      reset({
+        enabled: existingAuth.enabled ?? true,
+        header_name: existingAuth.header_name ?? 'X-MW-Token',
+        token: '', // 不回填脱敏值，强迫用户主动输入新 token 才会覆盖
+      })
+    }
+  }, [existingAuth, reset])
+
+  // 是否已有 token（后端返回的脱敏值包含 ****)
+  const hasExistingToken = !!(existingAuth?.token && existingAuth.token.length > 0)
+
   const { mutate, isPending } = useMutation({
-    mutationFn: (d: AuthFormFields) =>
-      authService.set(sourceId, {
+    mutationFn: (d: AuthFormFields) => {
+      const payload: IngressAuth = {
         enabled: d.enabled,
         mode: 'static_token',
         header_name: d.header_name,
-        token: d.token,
-      } satisfies IngressAuth),
-    onSuccess: () => addToast('success', 'Ingress auth saved'),
+        // 如果 token 为空，说明用户不想修改，不传 token 字段（后端保留原值）
+        // 如果非空，才覆盖
+        ...(d.token.trim() ? { token: d.token.trim() } : {}),
+      }
+      return authService.set(sourceId, payload)
+    },
+    onSuccess: () => {
+      addToast('success', 'Ingress auth saved')
+      setValue('token', '') // 保存后清空，避免意外重复提交
+    },
     onError: (e: Error) => addToast('error', e.message),
   })
 
   return (
     <Card
       title="Ingress Authentication"
-      description="Only requests with the correct X-MW-Token header will be accepted"
+      description="Only requests with the correct header token will be accepted"
     >
       <form onSubmit={handleSubmit((d) => mutate(d))} className="space-y-4">
         <div className="flex items-center gap-3">
@@ -102,14 +129,24 @@ export function SourceAuthForm({ sourceId }: { sourceId: string }) {
         />
 
         <div className="flex flex-col gap-1">
-          <label className="text-sm font-medium text-gray-700">Token</label>
+          <div className="flex items-center justify-between">
+            <label className="text-sm font-medium text-gray-700">Token</label>
+            {hasExistingToken && (
+              <span className="text-xs text-emerald-600 bg-emerald-50 border border-emerald-200 px-2 py-0.5 rounded-full">
+                ✓ Token already set — leave blank to keep existing
+              </span>
+            )}
+          </div>
           <div className="flex gap-2">
             <div className="relative flex-1">
               <input
                 type={showToken ? 'text' : 'password'}
                 className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm font-mono pr-10 focus:outline-none focus:ring-2 focus:ring-brand-500"
-                placeholder="Set a strong random token"
-                {...register('token', { required: 'Required' })}
+                placeholder={hasExistingToken ? '留空保持现有 token 不变' : 'Set a strong random token'}
+                {...register('token', {
+                  // 已有 token 时允许为空（不修改）；无 token 时必填
+                  required: hasExistingToken ? false : 'Required',
+                })}
               />
               <button
                 type="button"
@@ -146,7 +183,7 @@ export function SourceAuthForm({ sourceId }: { sourceId: string }) {
           <span className="text-gray-500"># FlightHub Webhook Transformer — ingest endpoint</span><br />
           curl -X POST {typeof window !== 'undefined' ? window.location.origin : ''}/webhook \<br />
           &nbsp;&nbsp;-H &quot;Content-Type: application/json&quot; \<br />
-          &nbsp;&nbsp;-H &quot;X-MW-Token: {tokenValue || '<token>'}&quot; \<br />
+          &nbsp;&nbsp;-H &quot;X-MW-Token: {tokenValue || (hasExistingToken ? '<existing-token>' : '<token>')}&quot; \<br />
           &nbsp;&nbsp;-d &apos;{`{"source":"${sourceId}","webhook_event":{...}}`}&apos;
         </div>
 

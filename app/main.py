@@ -291,6 +291,13 @@ async def source_auth_set(payload: dict[str, Any], x_admin_token: str | None = H
     if not source or cfg is None:
         return {"status": "error", "message": "missing source or auth"}
 
+    # 如果前端未传 token（留空保留原值），从 Redis 读取原 token 合并
+    if isinstance(cfg, dict) and not cfg.get("token"):
+        existing = await repo.get_source_auth(source)
+        if isinstance(existing, dict) and existing.get("token"):
+            cfg = dict(cfg)
+            cfg["token"] = existing["token"]
+
     await repo.set_source_auth(source, cfg)
     return {"status": "ok"}
 

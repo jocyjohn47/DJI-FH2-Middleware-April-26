@@ -47,8 +47,9 @@ export function Dashboard() {
           const mapCfg   = mapping.status === 'fulfilled' ? mapping.value : null
           const egsCfg   = egress.status  === 'fulfilled' ? egress.value  : null
 
+          // token 含 **** 表示后端已脱敏 → 说明 token 已设置 → ok
           const authStatus: StepStatus =
-            authCfg?.enabled && authCfg?.token && !authCfg.token.includes('****') ? 'ok' :
+            authCfg?.enabled && authCfg?.token ? 'ok' :
             authCfg ? 'warn' : 'missing'
 
           const mapStatus: StepStatus =

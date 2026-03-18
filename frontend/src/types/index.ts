@@ -6,7 +6,7 @@ export interface IngressAuth {
   enabled: boolean
   mode: AuthMode
   header_name: string
-  token: string        // masked on read from backend
+  token?: string       // optional: omit to keep existing; masked on read from backend
 }
 
 export interface MappingRow {
