@@ -41,6 +41,13 @@ if _os.path.isdir(_CONSOLE_DIR):
         index = _os.path.join(_CONSOLE_DIR, "index.html")
         return _FileResponse(index)
 
+@app.get("/favicon.ico", include_in_schema=False)
+async def favicon():
+    """Suppress browser 404 noise for favicon requests."""
+    from fastapi.responses import Response
+    return Response(status_code=204)
+
+
 _TOKEN_PATTERNS = {
     "X-User-Token": [
         re.compile(r"(?im)^\s*X-User-Token\s*:\s*([^\r\n]+)\s*$"),

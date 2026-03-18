@@ -13,9 +13,10 @@ export default defineConfig({
       '/webhook': 'http://127.0.0.1:8000',
     },
   },
+  // base 设为 /console/，让构建产物中所有资源引用路径带上前缀
+  // index.html 里 <script src="/console/assets/..."> 才能命中后端挂载路径
+  base: '/console/',
   build: {
-    // 本地开发：输出到 ../app/static/console（相对 frontend/ 目录）
-    // Docker 构建：workdir=/app/frontend，outDir=/app/app/static/console（绝对路径由 Dockerfile 处理）
     outDir: path.resolve(__dirname, '../app/static/console'),
     emptyOutDir: true,
   },
