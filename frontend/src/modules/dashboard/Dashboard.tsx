@@ -80,7 +80,7 @@ export function Dashboard() {
         <div>
           <h1 className="text-2xl font-bold text-gray-900">Dashboard</h1>
           <p className="text-sm text-gray-500 mt-1">
-            Universal Webhook Middleware — DJI FlightHub2
+            FlightHub Webhook Transformer — DJI FlightHub2
           </p>
         </div>
         <Button onClick={() => { startWizard(); navigate('/wizard') }}>

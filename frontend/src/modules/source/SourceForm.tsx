@@ -142,8 +142,10 @@ export function SourceAuthForm({ sourceId }: { sourceId: string }) {
           <p className="text-xs text-gray-400">Token is write-only — backend returns masked value on read</p>
         </div>
 
-        <div className="p-3 bg-gray-50 rounded-lg font-mono text-xs text-gray-500 border border-gray-200">
-          curl -X POST /webhook \<br />
+        <div className="p-3 bg-gray-900 rounded-lg font-mono text-xs text-green-400 border border-gray-700 overflow-x-auto">
+          <span className="text-gray-500"># FlightHub Webhook Transformer — ingest endpoint</span><br />
+          curl -X POST {typeof window !== 'undefined' ? window.location.origin : ''}/webhook \<br />
+          &nbsp;&nbsp;-H &quot;Content-Type: application/json&quot; \<br />
           &nbsp;&nbsp;-H &quot;X-MW-Token: {tokenValue || '<token>'}&quot; \<br />
           &nbsp;&nbsp;-d &apos;{`{"source":"${sourceId}","webhook_event":{...}}`}&apos;
         </div>
@@ -187,16 +189,24 @@ export function WebhookURL({ sourceId }: { sourceId: string }) {
   const url = `${window.location.origin}/webhook`
 
   return (
-    <div className="flex items-center gap-2 p-3 bg-gray-50 rounded-lg border border-gray-200">
-      <span className="text-xs text-gray-500 font-medium">Webhook URL</span>
-      <code className="flex-1 text-xs font-mono text-gray-700 truncate">{url}</code>
-      <span className="text-xs bg-gray-200 text-gray-500 px-1.5 py-0.5 rounded font-mono">source={sourceId}</span>
-      <button
-        onClick={() => { navigator.clipboard.writeText(url); addToast('info', 'Copied!') }}
-        className="text-gray-400 hover:text-gray-600"
-      >
-        <Copy className="w-4 h-4" />
-      </button>
+    <div className="space-y-2">
+      {/* Endpoint row */}
+      <div className="flex items-center gap-2 p-3 bg-blue-50 rounded-lg border border-blue-200">
+        <span className="text-xs font-semibold text-blue-600 shrink-0">Webhook Endpoint</span>
+        <code className="flex-1 text-xs font-mono text-blue-800 truncate">{url}</code>
+        <span className="text-xs bg-blue-100 text-blue-600 px-1.5 py-0.5 rounded font-mono shrink-0">POST</span>
+        <button
+          onClick={() => { navigator.clipboard.writeText(url); addToast('info', 'URL copied!') }}
+          className="text-blue-400 hover:text-blue-600 shrink-0"
+          title="Copy URL"
+        >
+          <Copy className="w-4 h-4" />
+        </button>
+      </div>
+      {/* Source hint */}
+      <p className="text-xs text-gray-400 pl-1">
+        Incoming requests must include <code className="bg-gray-100 px-1 rounded">"source": "{sourceId}"</code> in the body
+      </p>
     </div>
   )
 }

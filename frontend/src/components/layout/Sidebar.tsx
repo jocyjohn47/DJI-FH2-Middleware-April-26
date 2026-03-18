@@ -20,8 +20,8 @@ export function Sidebar() {
             <Zap className="w-4 h-4 text-white" />
           </div>
           <span className="font-bold text-white text-sm leading-tight">
-            Webhook<br />
-            <span className="text-gray-400 font-normal">Middleware</span>
+            FlightHub<br />
+            <span className="text-gray-400 font-normal">Webhook Transformer</span>
           </span>
         </div>
       </div>
@@ -51,6 +51,7 @@ export function Sidebar() {
       {/* Footer */}
       <div className="px-4 py-3 border-t border-gray-800 text-xs text-gray-500">
         POC v0.2 · DJI FlightHub2
+        <div className="mt-1 font-mono break-all text-gray-600 text-[10px]">POST /webhook</div>
       </div>
     </aside>
   )
