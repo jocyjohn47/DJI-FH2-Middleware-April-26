@@ -11,6 +11,10 @@ from app.config import settings
 from app.redis_repo import RedisRepo
 from app.mapping_engine import apply_mappings
 from app.template_engine import render_obj
+# ── NEW pipeline stages (STEP 4) ─────────────────────────────────────────────
+from app.flatten import flatten_json
+from app.adapter_engine import apply_adapter
+from app.enrichment import enrich
 
 
 def _now_ts() -> int:
@@ -86,12 +90,31 @@ async def run():
                 headers = dict(headers)
                 headers.setdefault("Content-Type", "application/json")
 
+                # ── NEW: flatten → adapter → mapping → enrich ─────────────
+                # Each step is a pure function; failure is caught per-stage.
+                # Falls back gracefully: adapter/enrich are no-ops when no
+                # config exists in Redis.
+
+                # 1. Flatten nested event into dot-notation dict
+                flat = flatten_json(webhook_event)
+
+                # 2. Adapter: normalize field names (no-op if not configured)
+                adapter_conf = await repo.get_adapter(source)
+                flat = apply_adapter(flat, adapter_conf)
+
+                # 3. Mapping (unchanged call-site; pass flat as extra arg)
                 try:
-                    unified = apply_mappings(webhook_event, source, mapping_conf, received_at)
+                    unified = apply_mappings(
+                        webhook_event, source, mapping_conf, received_at,
+                        flat_event=flat,   # NEW optional param
+                    )
                 except Exception as e:
                     print(f"[worker] mapping error source={source}: {e}")
                     await redis.xack(settings.STREAM_KEY_RAW, settings.STREAM_GROUP, msg_id)
                     continue
+
+                # 4. Enrichment: inject device metadata (no-op if key absent)
+                unified = await enrich(unified, repo)
 
                 ctx = dict(unified)
                 if isinstance(template_body, dict) and "workflow_uuid" in template_body:

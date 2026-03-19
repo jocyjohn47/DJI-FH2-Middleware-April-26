@@ -37,6 +37,20 @@ class RedisRepo:
     def _k_srcauth(source: str) -> str:
         return f"uw:srcauth:{source}"
 
+    # ── NEW keys (STEP 6) ─────────────────────────────────────────────────────
+
+    @staticmethod
+    def _k_adapter(source: str) -> str:
+        """uw:adapter:{source}  →  adapter field-normalization config."""
+        return f"uw:adapter:{source}"
+
+    @staticmethod
+    def _k_device(device_id: str) -> str:
+        """uw:device:{device_id}  →  device metadata for enrichment."""
+        return f"uw:device:{device_id}"
+
+    # ── Existing methods (unchanged) ──────────────────────────────────────────
+
     async def get_mapping(self, source: str) -> dict:
         raw = await self.redis.get(self._k_map(source))
         if not raw:
@@ -63,3 +77,28 @@ class RedisRepo:
 
     async def set_source_auth(self, source: str, cfg: dict) -> None:
         await self.redis.set(self._k_srcauth(source), json.dumps(cfg, ensure_ascii=False))
+
+    # ── NEW methods (STEP 6) ──────────────────────────────────────────────────
+
+    async def get_adapter(self, source: str) -> dict:
+        """Return adapter config for *source*.  Empty dict if not configured."""
+        raw = await self.redis.get(self._k_adapter(source))
+        if not raw:
+            return {}
+        return json.loads(raw)
+
+    async def set_adapter(self, source: str, cfg: dict) -> None:
+        """Persist adapter config for *source*."""
+        await self.redis.set(self._k_adapter(source), json.dumps(cfg, ensure_ascii=False))
+
+    async def get_device(self, device_id: str) -> dict:
+        """Return device metadata.  Empty dict if not found."""
+        raw = await self.redis.get(self._k_device(device_id))
+        if not raw:
+            return {}
+        return json.loads(raw)
+
+    async def set_device(self, device_id: str, info: dict) -> None:
+        """Persist device metadata."""
+        await self.redis.set(self._k_device(device_id), json.dumps(info, ensure_ascii=False))
+
