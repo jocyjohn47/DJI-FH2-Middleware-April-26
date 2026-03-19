@@ -374,3 +374,159 @@ async def flighthub_set(payload: dict[str, Any], x_admin_token: str | None = Hea
 
     await repo.set_fhcfg(source, cfg)
     return {"status": "ok"}
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# ADAPTER  (uw:adapter:{source})
+# ════════════════════════════════════════════════════════════════════════════
+
+@app.post("/admin/adapter/get")
+async def adapter_get(payload: dict[str, Any], x_admin_token: str | None = Header(default=None)):
+    global repo
+    assert repo is not None
+    _require_admin(x_admin_token)
+
+    source = payload.get("source")
+    if not source:
+        return {"status": "error", "message": "missing source"}
+
+    cfg = await repo.get_adapter(source)
+    return {"status": "ok", "source": source, "adapter": cfg}
+
+
+@app.post("/admin/adapter/set")
+async def adapter_set(payload: dict[str, Any], x_admin_token: str | None = Header(default=None)):
+    global repo
+    assert repo is not None
+    _require_admin(x_admin_token)
+
+    source = payload.get("source")
+    cfg = payload.get("adapter")
+    if not source or cfg is None:
+        return {"status": "error", "message": "missing source or adapter"}
+
+    await repo.set_adapter(source, cfg)
+    return {"status": "ok"}
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# DEVICE  (uw:device:{device_id})
+# ════════════════════════════════════════════════════════════════════════════
+
+@app.post("/admin/device/get")
+async def device_get(payload: dict[str, Any], x_admin_token: str | None = Header(default=None)):
+    global repo
+    assert repo is not None
+    _require_admin(x_admin_token)
+
+    device_id = payload.get("device_id")
+    if not device_id:
+        return {"status": "error", "message": "missing device_id"}
+
+    info = await repo.get_device(device_id)
+    return {"status": "ok", "device_id": device_id, "device": info}
+
+
+@app.post("/admin/device/set")
+async def device_set(payload: dict[str, Any], x_admin_token: str | None = Header(default=None)):
+    global repo
+    assert repo is not None
+    _require_admin(x_admin_token)
+
+    device_id = payload.get("device_id")
+    info = payload.get("device")
+    if not device_id or info is None:
+        return {"status": "error", "message": "missing device_id or device"}
+
+    await repo.set_device(device_id, info)
+    return {"status": "ok"}
+
+
+@app.post("/admin/device/delete")
+async def device_delete(payload: dict[str, Any], x_admin_token: str | None = Header(default=None)):
+    global repo
+    assert repo is not None
+    _require_admin(x_admin_token)
+
+    device_id = payload.get("device_id")
+    if not device_id:
+        return {"status": "error", "message": "missing device_id"}
+
+    await repo.redis.delete(repo._k_device(device_id))
+    return {"status": "ok"}
+
+
+@app.post("/admin/device/list")
+async def device_list(payload: dict[str, Any], x_admin_token: str | None = Header(default=None)):
+    global repo
+    assert repo is not None
+    _require_admin(x_admin_token)
+
+    device_ids: list[str] = []
+    cursor = 0
+    while True:
+        cursor, keys = await repo.redis.scan(cursor=cursor, match="uw:device:*", count=200)
+        for k in keys:
+            if isinstance(k, bytes):
+                k = k.decode("utf-8", errors="ignore")
+            device_ids.append(k[len("uw:device:"):])
+        if cursor == 0:
+            break
+
+    return {"status": "ok", "devices": sorted(device_ids)}
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# DEBUG  — run full pipeline on a sample payload, return each stage output
+# ════════════════════════════════════════════════════════════════════════════
+
+@app.post("/admin/debug/run")
+async def debug_run(payload: dict[str, Any], x_admin_token: str | None = Header(default=None)):
+    """Dry-run the full processing pipeline without writing to Redis Stream.
+
+    Input:  { source, sample_payload }
+    Output: { raw, flat, normalized, mapped, event }
+    """
+    global repo
+    assert repo is not None
+    _require_admin(x_admin_token)
+
+    import time as _time
+    from app.flatten import flatten_json
+    from app.adapter_engine import apply_adapter
+    from app.mapping_engine import apply_mappings
+    from app.canonical import build_event
+    from app.enrichment import enrich
+
+    source = payload.get("source") or settings.DEFAULT_SOURCE
+    raw: dict = payload.get("sample_payload") or {}
+
+    stages: dict[str, Any] = {"source": source, "raw": raw}
+
+    try:
+        # Stage 1 — flatten
+        flat = flatten_json(raw)
+        stages["flat"] = flat
+
+        # Stage 2 — adapter
+        adapter_conf = await repo.get_adapter(source)
+        normalized = apply_adapter(flat, adapter_conf)
+        stages["normalized"] = normalized
+
+        # Stage 3 — mapping
+        mapping_conf = await repo.get_mapping(source)
+        received_at = int(_time.time())
+        mapped = apply_mappings(raw, source, mapping_conf, received_at, flat_event=normalized)
+        stages["mapped"] = mapped
+
+        # Stage 4 — canonical
+        event = build_event(mapped, raw, source)
+
+        # Stage 5 — enrichment (read-only, no side effects)
+        event = await enrich(event, repo)
+        stages["event"] = event
+
+        return {"status": "ok", **stages}
+
+    except Exception as exc:
+        return {"status": "error", "message": str(exc), **stages}

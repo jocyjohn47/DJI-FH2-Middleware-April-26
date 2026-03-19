@@ -2,7 +2,7 @@ import { clsx } from 'clsx'
 import type { ReactNode } from 'react'
 
 interface CardProps {
-  title?: string
+  title?: string | ReactNode
   description?: string
   children: ReactNode
   className?: string

@@ -8,6 +8,8 @@ import SourcesPage from '@/modules/source/SourcesPage'
 import MappingPage from '@/modules/mapping/MappingPage'
 import EgressPage from '@/modules/egress/EgressPage'
 import WizardPage from '@/modules/wizard/WizardPage'
+import AdapterPage from '@/modules/adapter/AdapterPage'
+import DevicePage from '@/modules/device/DevicePage'
 import './index.css'
 
 const qc = new QueryClient({
@@ -28,8 +30,10 @@ ReactDOM.createRoot(document.getElementById('root')!).render(
           <Route element={<AppLayout />}>
             <Route index element={<Dashboard />} />
             <Route path="sources"  element={<SourcesPage />} />
+            <Route path="adapter"  element={<AdapterPage />} />
             <Route path="mapping"  element={<MappingPage />} />
             <Route path="egress"   element={<EgressPage />} />
+            <Route path="device"   element={<DevicePage />} />
             <Route path="wizard"   element={<WizardPage />} />
           </Route>
         </Routes>

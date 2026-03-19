@@ -84,6 +84,67 @@ export interface ApiError {
 
 export type ApiResult<T = unknown> = ApiOk<T> | ApiError
 
+// ─── Adapter (uw:adapter:{source}) ───────────────────────────────────────────
+
+/** One row in the adapter field-normalization table */
+export interface AdapterField {
+  target: string          // normalized key, e.g. "event.name"
+  paths: string[]         // candidate paths in priority order
+}
+
+export interface AdapterConfig {
+  fields: Record<string, string[]>   // { "event.name": ["Event.Name", "eventType"] }
+}
+
+// ─── Mapping DSL (uw:map:{source}) ───────────────────────────────────────────
+
+export interface DslCase {
+  if: string              // e.g. "$.event.name == 'VMD'"
+  then: string | number   // replacement value
+}
+
+export interface DslRule {
+  from?: string[]         // flat-dict keys tried in order
+  default?: string | number | boolean | null
+  cases?: DslCase[]
+  transform?: 'upper' | 'lower' | 'strip' | 'int' | 'float' | 'bool' | 'str'
+  type?: 'string' | 'int' | 'float' | 'bool' | 'json'
+  required?: boolean
+}
+
+/** DSL mapping config — stored under { dsl: { ... } } */
+export interface DslMappingConfig {
+  dsl: Record<string, DslRule>
+}
+
+// ─── Device (uw:device:{device_id}) ──────────────────────────────────────────
+
+export interface DeviceLocation {
+  lat?: number | null
+  lng?: number | null
+  alt?: number | null
+}
+
+export interface DeviceInfo {
+  device_id: string
+  model?: string
+  site?: string
+  location?: DeviceLocation
+}
+
+// ─── Debug pipeline ───────────────────────────────────────────────────────────
+
+export interface DebugResult {
+  status: 'ok' | 'error'
+  source: string
+  raw: Record<string, unknown>
+  flat?: Record<string, unknown>
+  normalized?: Record<string, unknown>
+  mapped?: Record<string, unknown>
+  event?: Record<string, unknown>
+  message?: string
+}
+
 // ─── UI / role ───────────────────────────────────────────────────────────────
 
 export type Role = 'admin' | 'operator' | 'readonly'

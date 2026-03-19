@@ -1,5 +1,5 @@
 import { apiClient } from './apiClient'
-import type { IngressAuth, MappingConfig, EgressConfig } from '@/types'
+import type { IngressAuth, MappingConfig, EgressConfig, AdapterConfig, DeviceInfo, DebugResult } from '@/types'
 
 // ─── Sources ─────────────────────────────────────────────────────────────────
 
@@ -59,6 +59,53 @@ export const tokenService = {
   async extract(raw: string): Promise<Record<string, string>> {
     const { data } = await apiClient.post('/admin/token/extract', { raw })
     return data.extracted ?? {}
+  },
+}
+
+// ─── Adapter (uw:adapter:{source}) ────────────────────────────────────────────
+
+export const adapterService = {
+  async get(sourceId: string): Promise<AdapterConfig> {
+    const { data } = await apiClient.post('/admin/adapter/get', { source: sourceId })
+    return (data.adapter ?? { fields: {} }) as AdapterConfig
+  },
+
+  async set(sourceId: string, adapter: AdapterConfig): Promise<void> {
+    await apiClient.post('/admin/adapter/set', { source: sourceId, adapter })
+  },
+}
+
+// ─── Device (uw:device:{device_id}) ───────────────────────────────────────────
+
+export const deviceService = {
+  async list(): Promise<string[]> {
+    const { data } = await apiClient.post('/admin/device/list', {})
+    return data.devices ?? []
+  },
+
+  async get(deviceId: string): Promise<DeviceInfo> {
+    const { data } = await apiClient.post('/admin/device/get', { device_id: deviceId })
+    return (data.device ?? {}) as DeviceInfo
+  },
+
+  async set(deviceId: string, info: DeviceInfo): Promise<void> {
+    await apiClient.post('/admin/device/set', { device_id: deviceId, device: info })
+  },
+
+  async delete(deviceId: string): Promise<void> {
+    await apiClient.post('/admin/device/delete', { device_id: deviceId })
+  },
+}
+
+// ─── Debug pipeline ───────────────────────────────────────────────────────────
+
+export const debugService = {
+  async run(sourceId: string, samplePayload: Record<string, unknown>): Promise<DebugResult> {
+    const { data } = await apiClient.post('/admin/debug/run', {
+      source: sourceId,
+      sample_payload: samplePayload,
+    })
+    return data as DebugResult
   },
 }
 

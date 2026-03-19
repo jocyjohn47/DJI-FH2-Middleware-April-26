@@ -11,10 +11,11 @@ from app.config import settings
 from app.redis_repo import RedisRepo
 from app.mapping_engine import apply_mappings
 from app.template_engine import render_obj
-# ── NEW pipeline stages (STEP 4) ─────────────────────────────────────────────
+# ── Pipeline stages ──────────────────────────────────────────────────────────
 from app.flatten import flatten_json
 from app.adapter_engine import apply_adapter
 from app.enrichment import enrich
+from app.canonical import build_event
 
 
 def _now_ts() -> int:
@@ -106,17 +107,20 @@ async def run():
                 try:
                     unified = apply_mappings(
                         webhook_event, source, mapping_conf, received_at,
-                        flat_event=flat,   # NEW optional param
+                        flat_event=flat,
                     )
                 except Exception as e:
                     print(f"[worker] mapping error source={source}: {e}")
                     await redis.xack(settings.STREAM_KEY_RAW, settings.STREAM_GROUP, msg_id)
                     continue
 
-                # 4. Enrichment: inject device metadata (no-op if key absent)
-                unified = await enrich(unified, repo)
+                # 4. Canonical envelope
+                event = build_event(unified, webhook_event, source)
 
-                ctx = dict(unified)
+                # 5. Enrichment: inject device metadata (no-op if key absent)
+                event = await enrich(event, repo)
+
+                ctx = dict(event)
                 if isinstance(template_body, dict) and "workflow_uuid" in template_body:
                     ctx["workflow_uuid"] = template_body.get("workflow_uuid")
 
