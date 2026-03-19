@@ -485,7 +485,7 @@ async def debug_run(payload: dict[str, Any], x_admin_token: str | None = Header(
     """Dry-run the full processing pipeline without writing to Redis Stream.
 
     Input:  { source, sample_payload }
-    Output: { raw, flat, normalized, mapped, event }
+    Output: { raw, flat, normalized, mapped, event, final_body, missing, normalized_fields }
     """
     global repo
     assert repo is not None
@@ -493,10 +493,11 @@ async def debug_run(payload: dict[str, Any], x_admin_token: str | None = Header(
 
     import time as _time
     from app.flatten import flatten_json
-    from app.adapter_engine import apply_adapter
+    from app.normalize import normalize, get_normalized_fields
     from app.mapping_engine import apply_mappings
     from app.canonical import build_event
     from app.enrichment import enrich
+    from app.autofill import autofill, build_fh2_body
 
     source = payload.get("source") or settings.DEFAULT_SOURCE
     raw: dict = payload.get("sample_payload") or {}
@@ -508,10 +509,11 @@ async def debug_run(payload: dict[str, Any], x_admin_token: str | None = Header(
         flat = flatten_json(raw)
         stages["flat"] = flat
 
-        # Stage 2 — adapter
+        # Stage 2 — normalize (adapter)
         adapter_conf = await repo.get_adapter(source)
-        normalized = apply_adapter(flat, adapter_conf)
+        normalized = normalize(flat, adapter_conf)
         stages["normalized"] = normalized
+        stages["normalized_fields"] = get_normalized_fields(flat, adapter_conf)
 
         # Stage 3 — mapping
         mapping_conf = await repo.get_mapping(source)
@@ -522,9 +524,25 @@ async def debug_run(payload: dict[str, Any], x_admin_token: str | None = Header(
         # Stage 4 — canonical
         event = build_event(mapped, raw, source)
 
-        # Stage 5 — enrichment (read-only, no side effects)
+        # Stage 5 — enrichment (read-only)
         event = await enrich(event, repo)
         stages["event"] = event
+
+        # Stage 6 — autofill → final FH2 body
+        fhcfg = await repo.get_fhcfg(source)
+        device_id = event.get("device_id") or event.get("device", {}).get("id") or ""
+        device_info = (await repo.get_device(str(device_id))) if device_id else {}
+        autofill_conf = fhcfg.get("autofill", {}) if isinstance(fhcfg, dict) else {}
+        workflow_uuid = ""
+        if isinstance(fhcfg, dict):
+            tb = fhcfg.get("template_body", {})
+            if isinstance(tb, dict):
+                workflow_uuid = str(tb.get("workflow_uuid", ""))
+
+        filled, missing = autofill(event, device_info, autofill_conf)
+        final_body = build_fh2_body(filled, workflow_uuid=workflow_uuid)
+        stages["final_body"] = final_body
+        stages["missing"] = missing
 
         return {"status": "ok", **stages}
 

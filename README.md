@@ -1,311 +1,254 @@
 # FlightHub Webhook Transformer
 
-> 针对 **DJI FlightHub2** 场景设计的通用 Webhook 中间件。支持多输入源先经过**入站鉴权**（static token），通过后进入 Redis Streams 队列，由 Worker 完成 **5 级处理管道**（展平 → 适配 → 映射 → 富化 → 模板渲染）后转发至 FlightHub2 工作流触发接口。
+> DJI FlightHub2 Webhook 中间件 — 接收第三方告警 Webhook，经标准化管道处理后转发至 FlightHub2 工作流 API。
 
-| 组件 | 技术 |
-|------|------|
-| API 层 | FastAPI + Uvicorn |
-| 消息队列 | Redis Streams |
-| Worker | Python asyncio + httpx |
-| 配置存储 | Redis（热更新，无需重启）|
-| 管理界面 | React 控制台 `/console` + Swagger `/docs` |
-| 容器化 | Docker 多阶段构建 + supervisord（API + 2 × Worker 同镜像）|
+**版本:** v6 · **最后更新:** 2026-03-19  
+**GitHub:** https://github.com/steven771806612-sys/Flighthub2-API-layer-coding
 
 ---
 
 ## 系统架构
 
 ```
-┌──────────────────────────────────────────────────────────────────┐
-│                       外部系统 (webhook 发送方)                    │
-│          HTTP POST /webhook                                       │
-│          Header: X-MW-Token: <inbound-token>                     │
-└──────────────────────┬───────────────────────────────────────────┘
-                       │
-                       ▼
-┌──────────────────────────────────────────────────────────────────┐
-│                   FastAPI  (Uvicorn · port 8000)                  │
-│                                                                   │
-│  ① 入站鉴权  →  uw:srcauth:{source}  (static_token / disabled)   │
-│  ② 入队     →  Redis Stream  uw:webhook:raw                       │
-│  ③ Admin API (/admin/*)  →  配置 CRUD                             │
-│  ④ React 控制台 静态托管  /console                                 │
-└──────────────────────┬───────────────────────────────────────────┘
-                       │  Redis Stream Consumer Group
-         ┌─────────────┴─────────────┐
-         ▼                           ▼
-  Worker-1                     Worker-2
-  ┌─────────────────────────────────────────────────────────────┐
-  │  STEP 1  flatten_json()    嵌套 JSON → dot-notation 扁平字典  │
-  │  STEP 2  apply_adapter()   字段别名归一化 (uw:adapter:{src})  │
-  │  STEP 3  apply_mappings()  JSONPath/DSL → 统一字段            │
-  │  STEP 4  enrich()          设备元数据注入 (uw:device:{id})    │
-  │  STEP 5  render_obj()      Mustache 模板渲染                  │
-  │  STEP 6  push_flighthub()  HTTP POST → FlightHub2 API        │
-  │          ↑ 指数退避重试 (max_retries / backoff)               │
-  └─────────────────────────────────────────────────────────────┘
-                       │
-                       ▼
-┌──────────────────────────────────────────────────────────────────┐
-│  DJI FlightHub2 API                                               │
-│  https://es-flight-api-us.djigate.com/openapi/v0.1/workflow      │
-└──────────────────────────────────────────────────────────────────┘
+外部系统
+   │
+   │  POST /webhook  (X-MW-Token 认证)
+   ▼
+┌─────────────────────────────────────────────┐
+│  FastAPI (Uvicorn · port 8000)              │
+│  ├─ /webhook         inbound handler        │
+│  ├─ /console         React 管理后台 (SPA)   │
+│  ├─ /ui              HTML 轻量 UI (legacy)  │
+│  ├─ /docs            Swagger API 文档       │
+│  └─ /admin/*         管理 API (18 端点)     │
+└────────────────┬────────────────────────────┘
+                 │ XADD
+                 ▼
+         Redis Stream (uw:webhook:raw)
+                 │
+        ┌────────┴────────┐
+        │  Consumer Group  │
+        │  uw-worker-group │
+        └────────┬────────┘
+                 │ XREADGROUP (×2 workers)
+                 ▼
+┌────────────────────────────────────────────────────────────┐
+│  Worker Pipeline (×2 并行)                                 │
+│                                                             │
+│  1. flatten     nested JSON → dot-notation dict            │
+│  2. normalize   应用 adapter 配置统一字段名                 │
+│  3. mapping     JSONPath/DSL 映射 → unified dict           │
+│  4. enrich      注入 device 元数据 (Redis lookup)          │
+│  5. autofill    补全 FH2 必填字段 + 构建最终 body           │
+│  6. HTTP POST   带重试逻辑推送至 FlightHub2 API             │
+└────────────────────────────────────────────────────────────┘
+                 │
+                 ▼
+        DJI FlightHub2 API
+   POST /openapi/v0.1/workflow
 ```
 
 ---
 
-## Worker 管道详解
+## 已实现功能
 
-### 处理阶段对比（旧版 vs 新版）
+### 后端核心
+| 模块 | 说明 |
+|------|------|
+| `app/main.py` | FastAPI 主入口，18 个 Admin API 端点 |
+| `app/flatten.py` | 嵌套 JSON → dot-notation（支持列表索引） |
+| `app/normalize.py` | 应用 adapter 配置，返回统一字段列表 |
+| `app/adapter_engine.py` | 字段候选路径映射（多路径回退） |
+| `app/mapping_engine.py` | JSONPath (legacy) + DSL (from/default/cases/transform) |
+| `app/enrichment.py` | 从 `uw:device:{id}` 注入设备元数据 |
+| `app/autofill.py` | 补全 FH2 必填字段，输出标准 body 结构 |
+| `app/redis_repo.py` | Redis CRUD（mapping/fhcfg/auth/adapter/device） |
+| `worker/worker.py` | 异步消费者，完整 6 步管道 |
 
-| 阶段 | 旧版（1 步）| 新版（5 步）|
-|------|------------|------------|
-| 数据预处理 | — | `flatten_json()` 展平嵌套 JSON |
-| 字段归一化 | — | `apply_adapter()` 别名映射 |
-| 字段映射 | `apply_mappings()` | `apply_mappings()` + `flat_event` 参数 |
-| 设备富化 | — | `enrich()` 注入设备位置/型号 |
-| 模板渲染 | `render_obj()` | `render_obj()`（不变）|
+### Worker 管道（v6 简化版）
+```
+raw → flatten_json → normalize → apply_mappings → enrich → autofill → build_fh2_body → HTTP POST
+```
+> ✅ 移除了 `template_engine` 和 `canonical` 层，由 `autofill.build_fh2_body()` 直接输出标准 FH2 请求体。
 
-### Mapping DSL 关键字速查
-
-| 关键字 | 作用 | 示例值 |
-|--------|------|--------|
-| `src` | JSONPath 路径（旧格式，向后兼容）| `"$.level"` |
-| `from` | 多路径取第一个非空（新格式）| `["Event.Level", "severity"]` |
-| `default` | 所有路径为空时的回退值 | `"info"` |
-| `cases` | 条件覆写 | `{"if": "$.level == 'critical'", "then": 3}` |
-| `transform` | 内置函数 | `"upper"` / `"lower"` / `"strip"` / `"int"` / `"float"` |
-| `type` | 类型转换 | `"string"` / `"float"` / `"bool"` |
-| `dst` | 输出字段名 | `"event_level"` |
-| `required` | 缺失时丢弃整条消息 | `true` |
+### Redis Key 一览
+| Key | 用途 |
+|-----|------|
+| `uw:webhook:raw` | Redis Stream（消息队列） |
+| `uw:srcauth:{source}` | Ingress token 认证配置 |
+| `uw:map:{source}` | 字段映射配置（legacy list 或 DSL dict） |
+| `uw:fhcfg:{source}` | FlightHub2 出口配置（endpoint/headers/retry） |
+| `uw:adapter:{source}` | 字段归一化 adapter 配置 |
+| `uw:device:{device_id}` | 设备元数据（GPS/site/model） |
 
 ---
 
-## 功能入口
+## 管理后台
 
-| 路径 | 方法 | 说明 |
+**React SPA** 访问路径：`/console`
+
+| 页面 | 路由 | 功能 |
 |------|------|------|
-| `/webhook` | POST | 入站 webhook（需带 `X-MW-Token`）|
-| `/console` | GET | React 管理控制台（主界面）|
-| `/ui/` | GET | 轻量 HTML 控制台（备用）|
-| `/docs` | GET | FastAPI Swagger 文档 |
-| `/admin/source/list` | POST | 列出所有 source |
-| `/admin/source/init` | POST | 初始化新 source |
-| `/admin/source/auth/get` | POST | 读取入站鉴权配置 |
-| `/admin/source/auth/set` | POST | 设置入站鉴权配置 |
-| `/admin/mapping/get` | POST | 读取字段映射配置 |
-| `/admin/mapping/set` | POST | 设置字段映射配置 |
-| `/admin/flighthub/get` | POST | 读取 FlightHub2 三件套配置 |
-| `/admin/flighthub/set` | POST | 设置 FlightHub2 三件套配置 |
-| `/admin/token/extract` | POST | 提取粘贴文本中的 Token 字段 |
+| Dashboard | `/console` | 系统概览，源状态 |
+| Sources | `/console/sources` | 创建/管理 webhook 源 |
+| Visual Mapper | `/console/mapping` | **核心** — 三栏可视化字段映射 |
+| Egress | `/console/egress` | FlightHub2 出口配置 |
+| Devices | `/console/device` | 设备元数据 CRUD |
+| New Integration | `/console/wizard` | 向导式新建集成 |
 
-> Admin 接口若设置了 `ADMIN_TOKEN` 环境变量，需在请求头携带 `X-Admin-Token`。
+### Visual Mapper 工作流
+1. 选择 source → 粘贴 Sample Payload
+2. 点击 **Load Fields & Preview** → 调用 `/admin/debug/run` → 左栏填充字段列表
+3. 中栏下拉选择目标 FH2 字段（支持 Auto-Suggest）
+4. 右栏实时预览 FH2 输出 body + Missing 字段面板
+5. 点击 **Save Mapping** → 保存至 Redis
 
 ---
 
-## Redis 数据模型
+## API 端点
 
-| 键名 | 内容 | 写入时机 |
-|------|------|----------|
-| `uw:srcauth:{source}` | 入站鉴权配置（enabled / header_name / token）| Admin API / 首次部署 |
-| `uw:map:{source}` | JSONPath / DSL 字段映射规则列表 | Admin API / 控制台 |
-| `uw:fhcfg:{source}` | FlightHub2 endpoint / headers / template_body / retry_policy | Admin API / 控制台 |
-| `uw:adapter:{source}` | 字段别名归一化规则（`{"fields": {...}}`）| Admin API / 手动写入 |
-| `uw:device:{device_id}` | 设备元数据（location / model / site）| 设备注册时写入 |
-| `uw:webhook:raw` | Redis Stream（消息队列主体）| API 层自动写入 |
+### Webhook 入口
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| POST | `/webhook` | 接收 webhook（X-MW-Token 认证） |
 
-### Adapter 配置示例（`uw:adapter:flighthub2`）
+### 管理端点（需 X-Admin-Token）
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| POST | `/admin/source/list` | 列出所有 source |
+| POST | `/admin/source/init` | 初始化 source 默认配置 |
+| POST | `/admin/source/auth/get` | 获取 ingress 认证配置 |
+| POST | `/admin/source/auth/set` | 设置 ingress 认证配置 |
+| POST | `/admin/mapping/get` | 获取字段映射配置 |
+| POST | `/admin/mapping/set` | 保存字段映射配置 |
+| POST | `/admin/flighthub/get` | 获取 FH2 出口配置 |
+| POST | `/admin/flighthub/set` | 保存 FH2 出口配置 |
+| POST | `/admin/token/extract` | 从 curl/header 文本提取 token |
+| POST | `/admin/adapter/get` | 获取字段归一化 adapter |
+| POST | `/admin/adapter/set` | 保存字段归一化 adapter |
+| POST | `/admin/device/list` | 列出所有设备 |
+| POST | `/admin/device/get` | 获取设备元数据 |
+| POST | `/admin/device/set` | 保存设备元数据 |
+| POST | `/admin/device/delete` | 删除设备 |
+| POST | `/admin/debug/run` | 管道干运行（调试用） |
+
+---
+
+## FH2 请求体结构
 
 ```json
 {
-  "fields": {
-    "event.name":  ["Event.Name", "eventType", "type"],
-    "device.id":   ["Event.Source.Id", "deviceId", "device_id"],
-    "event.level": ["Event.Level", "severity", "level"]
+  "workflow_uuid": "uuid-from-config",
+  "trigger_type": 0,
+  "name": "Alert-{event_name}",
+  "params": {
+    "creator": "pilot01",
+    "latitude": 22.543096,
+    "longitude": 114.057865,
+    "level": 3,
+    "desc": "obstacle detected"
   }
 }
 ```
 
-### Device 元数据示例（`uw:device:DJI-001`）
-
-```json
-{
-  "device_id": "DJI-001",
-  "model":     "Matrice 300 RTK",
-  "site":      "SZ-HQ",
-  "location":  {"lat": 22.543096, "lng": 114.057865, "alt": 120}
-}
-```
+### Autofill 优先级（params 字段）
+1. mapped dict 中已存在的值
+2. `uw:device:{device_id}` 的 location（lat/lng）
+3. FH2 配置中的 `autofill` 覆盖值
+4. 硬编码默认值（creator="system", level=3, desc=""）
+5. 标记为 `missing[]`
 
 ---
 
-## 部署方式
+## 部署
 
-### 方式一：Railway（推荐）
-
-1. **注册 Railway**：访问 [railway.app](https://railway.app)，用 GitHub 账号登录
-2. **新建项目**：`New Project` → `Deploy from GitHub repo` → 选择 `Flighthub2-API-layer-coding`
-3. **添加 Redis**：`+ New` → `Database` → `Add Redis`，Railway 自动注入 `REDIS_URL`
-4. **配置环境变量**（Variables 面板）：
-
-   | 变量 | 说明 |
-   |------|------|
-   | `REDIS_URL` | Railway Redis 自动注入，无需手动填写 |
-   | `ADMIN_TOKEN` | Admin 接口保护 Token（建议设置）|
-
-5. 部署完成后，在 Settings → Networking 生成公网域名
-6. **初始化入站 Token**（首次部署后执行）：
-   ```bash
-   curl -X POST https://your-app.railway.app/admin/source/auth/set \
-     -H 'Content-Type: application/json' \
-     -H 'X-Admin-Token: your-admin-token' \
-     -d '{
-       "source": "flighthub2",
-       "auth": {
-         "enabled": true,
-         "mode": "static_token",
-         "header_name": "X-MW-Token",
-         "token": "your-strong-inbound-token"
-       }
-     }'
-   ```
-
----
-
-### 方式二：Docker Compose（本地 / 自托管）
-
+### Railway（推荐）
 ```bash
-git clone https://github.com/steven771806612-sys/Flighthub2-API-layer-coding.git
-cd Flighthub2-API-layer-coding
-
-docker compose up -d --build
-docker compose logs -f app
-
-# 初始化入站 Token
-redis-cli set "uw:srcauth:flighthub2" \
-  '{"enabled":true,"mode":"static_token","header_name":"X-MW-Token","token":"your-token"}'
+# 1. 创建 Railway 项目，添加 Redis 插件
+# 2. Railway 自动注入 REDIS_URL
+# 3. 部署后初始化 source
+curl -X POST https://your-app.railway.app/admin/source/init \
+  -H "Content-Type: application/json" \
+  -H "X-Admin-Token: your-token" \
+  -d '{"source": "flighthub2", "force": true}'
 ```
 
-访问：控制台 http://localhost:8000/console · Swagger http://localhost:8000/docs
-
----
-
-### 方式三：沙盒 / 本机调试（PM2）
-
-```bash
-sudo apt-get install -y redis-server redis-tools
-pip install -r requirements.txt
-redis-server --daemonize yes
-
-export PYTHONPATH=$(pwd)
-python3 scripts/bootstrap_redis.py
-
-pm2 start ecosystem.config.cjs
-```
-
----
-
-## 快速测试
-
-```bash
-# 无 Token → 期望 401
-curl -X POST https://your-app.railway.app/webhook \
-  -H 'Content-Type: application/json' \
-  -d '{"source":"flighthub2","webhook_event":{}}'
-
-# 正确 Token + 完整事件 → 期望 200
-curl -X POST https://your-app.railway.app/webhook \
-  -H 'Content-Type: application/json' \
-  -H 'X-MW-Token: your-inbound-token' \
-  -d '{
-    "source": "flighthub2",
-    "webhook_event": {
-      "timestamp": "2026-03-19T10:00:00Z",
-      "creator_id": "pilot01",
-      "latitude": 22.543096,
-      "longitude": 114.057865,
-      "level": "warning",
-      "description": "obstacle detected"
-    }
-  }'
-```
-
----
-
-## 环境变量
-
+### 环境变量
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
-| `REDIS_URL` | `redis://127.0.0.1:6379/0` | Redis 连接地址 |
-| `PORT` | `8000` | API 监听端口 |
-| `STREAM_KEY_RAW` | `uw:webhook:raw` | Redis Stream 键名 |
-| `STREAM_GROUP` | `uw-worker-group` | Consumer Group 名 |
-| `ADMIN_TOKEN` | _(空，不鉴权)_ | Admin 接口保护 Token |
-| `DEFAULT_SOURCE` | `flighthub2` | 默认 source 名称 |
+| `REDIS_URL` | `redis://127.0.0.1:6379/0` | Redis 连接（Railway 自动注入） |
+| `PORT` | `8000` | 服务端口 |
+| `ADMIN_TOKEN` | 空（不鉴权） | 管理接口保护 token |
+| `DEFAULT_SOURCE` | `flighthub2` | 默认 source slug |
+| `STREAM_KEY_RAW` | `uw:webhook:raw` | Redis Stream key |
+| `STREAM_GROUP` | `uw-worker-group` | Consumer group 名 |
+
+### 本地开发（Sandbox / Docker Compose）
+```bash
+# Docker Compose
+docker compose up -d --build
+
+# 或使用 PM2（sandbox）
+pm2 restart all
+
+# 访问
+# http://localhost:8000/console  →  管理后台
+# http://localhost:8000/docs     →  Swagger
+```
 
 ---
 
 ## 项目结构
 
 ```
-.
+webapp/
 ├── app/
-│   ├── main.py              # FastAPI 应用入口
-│   ├── config.py            # 环境变量配置
-│   ├── redis_repo.py        # Redis 数据访问层（含 adapter/device 方法）
-│   ├── queue_bus.py         # Redis Stream 生产者
-│   ├── mapping_engine.py    # JSONPath / DSL 字段映射（向后兼容）
-│   ├── template_engine.py   # Mustache 模板渲染
-│   ├── flatten.py           # ★ 嵌套 JSON → dot-notation 展平
-│   ├── adapter_engine.py    # ★ 字段别名归一化层
-│   ├── enrichment.py        # ★ 设备元数据富化（可选）
-│   └── static/              # React 控制台编译产物
-│       └── console/
+│   ├── main.py              FastAPI 入口 + 所有 API 路由
+│   ├── config.py            Settings（pydantic）
+│   ├── redis_repo.py        Redis CRUD 封装
+│   ├── flatten.py           nested JSON → dot-notation
+│   ├── normalize.py         adapter 归一化封装
+│   ├── adapter_engine.py    字段候选路径映射
+│   ├── mapping_engine.py    JSONPath + DSL 映射引擎
+│   ├── enrichment.py        设备元数据注入
+│   ├── autofill.py          FH2 字段自动填充 + body 构建
+│   └── static/console/      React SPA 构建产物
 ├── worker/
-│   └── worker.py            # Redis Stream 消费者（5 级管道）
-├── frontend/                # React + TypeScript 管理控制台源码
-│   ├── src/
-│   │   ├── modules/         # Dashboard / Sources / Mapping / Egress / Wizard
-│   │   ├── services/        # API 调用封装
-│   │   ├── store/           # Zustand 状态管理
-│   │   └── types/           # TypeScript 类型定义
-│   └── vite.config.ts       # 构建配置（base: '/console/'）
-├── scripts/
-│   ├── bootstrap_redis.py   # Redis 默认配置初始化
-│   └── sandbox_test.sh      # E2E 测试脚本
-├── docs/
-│   └── pipeline_config_examples.py  # ★ Adapter / Mapping DSL 示例配置
+│   └── worker.py            Redis Stream 消费者（6 步管道）
+├── frontend/                React + Vite + TypeScript 源码
+│   └── src/
+│       ├── modules/
+│       │   ├── mapping/     MappingBoard（三栏可视化）
+│       │   ├── device/      DevicePage
+│       │   ├── egress/      EgressConfigPanel
+│       │   ├── source/      SourcesPage
+│       │   └── wizard/      IntegrationWizard
+│       ├── store/           Zustand stores
+│       ├── services/        API 服务层（18 端点）
+│       └── types/           TypeScript 类型定义
 ├── deploy/
-│   ├── supervisord.conf     # 进程管理配置（api + worker-1 + worker-2）
-│   └── entrypoint.sh        # Docker 启动入口（等待 Redis + 启动 supervisord）
-├── Dockerfile               # 三阶段多阶段构建（py-builder / fe-builder / runtime）
-├── docker-compose.yml       # 本地完整环境
-├── railway.toml             # Railway 平台部署配置
-├── ecosystem.config.cjs     # PM2 配置（本地调试用）
-└── requirements.txt         # Python 依赖
+│   ├── supervisord.conf     进程守护配置
+│   └── entrypoint.sh        Docker 启动脚本
+├── Dockerfile
+├── docker-compose.yml
+└── railway.toml
 ```
-
-> ★ 标注为本次新增模块。
 
 ---
 
-## 部署状态
+## 已完成 ✅
+- FastAPI + Redis Stream 完整消息队列
+- 6 步 Worker 管道（flatten → normalize → mapping → enrich → autofill → HTTP）
+- DSL 映射引擎（from/default/cases/transform）
+- 设备元数据注册与 GPS 自动注入
+- React 三栏可视化字段映射器（带实时预览）
+- Debug 管道干运行（`/admin/debug/run`）
+- Auto-suggest 字段映射
+- Railway + Docker Compose 部署支持
 
-- **GitHub**: https://github.com/steven771806612-sys/Flighthub2-API-layer-coding
-- **推荐托管平台**: Railway（Docker + Redis 原生支持，healthcheckTimeout: 180s）
-- **最后更新**: 2026-03-19
-- **当前版本**: v4（5 级 Worker 管道 + React 控制台 + Token 保存修复）
-
-### 已完成
-- [x] Railway 部署修复（supervisord 环境变量、entrypoint Redis 等待、healthcheck 超时）
-- [x] Dockerfile 前端构建路径修正（base: '/console/'）
-- [x] React 控制台空白页修复（Vite base 路径）
-- [x] Token 保存不覆盖原值（auth/set 后端合并逻辑）
-- [x] Worker 升级至 5 级处理管道（flatten → adapter → mapping → enrich → template）
-- [x] 新增 Redis Key：`uw:adapter:{source}`、`uw:device:{device_id}`
-- [x] 前端名称更新为 **FlightHub Webhook Transformer**
-
-### 待办
-- [ ] 控制台新增 Adapter 配置页面（前端 UI）
-- [ ] 控制台新增设备管理页面（`uw:device:*` CRUD）
-- [ ] Railway 生产环境部署验证
+## 待完成 / 可扩展
+- [ ] Mapping DSL 可视化编辑器（RuleBuilder）重新接入
+- [ ] 前端 Adapter 配置页面（当前隐藏，后端已支持）
+- [ ] 多租户 / 多 source 批量管理
+- [ ] Webhook 历史记录查询（Redis Stream 回放）
+- [ ] FlightHub2 API 响应解析与错误告警

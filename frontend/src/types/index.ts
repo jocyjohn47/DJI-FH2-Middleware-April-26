@@ -132,7 +132,7 @@ export interface DeviceInfo {
   location?: DeviceLocation
 }
 
-// ─── Debug pipeline ───────────────────────────────────────────────────────────
+// ─── Debug pipeline (extended v2) ────────────────────────────────────────────
 
 export interface DebugResult {
   status: 'ok' | 'error'
@@ -140,9 +140,41 @@ export interface DebugResult {
   raw: Record<string, unknown>
   flat?: Record<string, unknown>
   normalized?: Record<string, unknown>
+  normalized_fields?: string[]
   mapped?: Record<string, unknown>
   event?: Record<string, unknown>
+  final_body?: FH2Body
+  missing?: string[]
   message?: string
+}
+
+// ─── FlightHub2 body structure ────────────────────────────────────────────────
+
+export interface FH2Params {
+  creator: string
+  latitude: number | null
+  longitude: number | null
+  level: number
+  desc: string
+}
+
+export interface FH2Body {
+  workflow_uuid: string
+  trigger_type: number
+  name: string
+  params: FH2Params
+}
+
+/** Visual mapping: normalized_field_key → fh2_body_path */
+export type VisualMapping = Record<string, string>
+
+/** FH2 target field definition */
+export interface FH2TargetField {
+  path: string                    // e.g. "params.latitude"
+  label: string                   // human label
+  type: 'string' | 'number' | 'int'
+  required: boolean
+  description?: string
 }
 
 // ─── UI / role ───────────────────────────────────────────────────────────────

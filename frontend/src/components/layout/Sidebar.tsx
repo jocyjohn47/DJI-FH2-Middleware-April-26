@@ -1,15 +1,14 @@
 import { NavLink } from 'react-router-dom'
-import { LayoutDashboard, Layers, ArrowRightLeft, Settings, Zap, SlidersHorizontal, Cpu } from 'lucide-react'
+import { LayoutDashboard, Layers, ArrowRightLeft, Settings, Zap, Cpu } from 'lucide-react'
 import { clsx } from 'clsx'
 
 const NAV = [
-  { to: '/',         label: 'Dashboard',    icon: LayoutDashboard },
-  { to: '/sources',  label: 'Sources',      icon: Layers },
-  { to: '/adapter',  label: 'Adapter',      icon: SlidersHorizontal },
-  { to: '/mapping',  label: 'Mapping',      icon: ArrowRightLeft },
-  { to: '/egress',   label: 'Egress',       icon: Settings },
-  { to: '/device',   label: 'Devices',      icon: Cpu },
-  { to: '/wizard',   label: 'New Integration', icon: Zap },
+  { to: '/',        label: 'Dashboard',       icon: LayoutDashboard },
+  { to: '/sources', label: 'Sources',          icon: Layers },
+  { to: '/mapping', label: 'Visual Mapper',    icon: ArrowRightLeft },
+  { to: '/egress',  label: 'Egress',           icon: Settings },
+  { to: '/device',  label: 'Devices',          icon: Cpu },
+  { to: '/wizard',  label: 'New Integration',  icon: Zap },
 ]
 
 export function Sidebar() {
@@ -52,7 +51,7 @@ export function Sidebar() {
 
       {/* Footer */}
       <div className="px-4 py-3 border-t border-gray-800 text-xs text-gray-500">
-        v0.3 · DJI FlightHub2
+        v0.4 · DJI FlightHub2
         <div className="mt-1 font-mono break-all text-gray-600 text-[10px]">POST /webhook</div>
       </div>
     </aside>

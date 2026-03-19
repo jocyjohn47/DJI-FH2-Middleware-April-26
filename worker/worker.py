@@ -10,12 +10,11 @@ from redis.asyncio import Redis
 from app.config import settings
 from app.redis_repo import RedisRepo
 from app.mapping_engine import apply_mappings
-from app.template_engine import render_obj
 # ── Pipeline stages ──────────────────────────────────────────────────────────
 from app.flatten import flatten_json
-from app.adapter_engine import apply_adapter
+from app.normalize import normalize
 from app.enrichment import enrich
-from app.canonical import build_event
+from app.autofill import autofill, build_fh2_body
 
 
 def _now_ts() -> int:
@@ -85,46 +84,53 @@ async def run():
 
                 endpoint = (fhcfg.get("endpoint") if isinstance(fhcfg, dict) else None) or settings.DEFAULT_FLIGHTHUB_ENDPOINT
                 headers = (fhcfg.get("headers") if isinstance(fhcfg, dict) else None) or {}
-                template_body = (fhcfg.get("template_body") if isinstance(fhcfg, dict) else None) or {}
                 retry_policy = (fhcfg.get("retry_policy") if isinstance(fhcfg, dict) else None) or {"max_retries": 3, "backoff": "exponential"}
 
                 headers = dict(headers)
                 headers.setdefault("Content-Type", "application/json")
 
-                # ── NEW: flatten → adapter → mapping → enrich ─────────────
-                # Each step is a pure function; failure is caught per-stage.
-                # Falls back gracefully: adapter/enrich are no-ops when no
-                # config exists in Redis.
-
-                # 1. Flatten nested event into dot-notation dict
+                # ── Pipeline: raw → flatten → normalize → mapping → autofill → HTTP ──
+                #
+                # Step 1: Flatten nested event into dot-notation dict
                 flat = flatten_json(webhook_event)
 
-                # 2. Adapter: normalize field names (no-op if not configured)
+                # Step 2: Normalize — apply adapter config to produce unified fields
                 adapter_conf = await repo.get_adapter(source)
-                flat = apply_adapter(flat, adapter_conf)
+                normalized_flat = normalize(flat, adapter_conf)
 
-                # 3. Mapping (unchanged call-site; pass flat as extra arg)
+                # Step 3: Mapping — JSONPath / DSL mappings applied to normalized flat
                 try:
                     unified = apply_mappings(
                         webhook_event, source, mapping_conf, received_at,
-                        flat_event=flat,
+                        flat_event=normalized_flat,
                     )
                 except Exception as e:
                     print(f"[worker] mapping error source={source}: {e}")
                     await redis.xack(settings.STREAM_KEY_RAW, settings.STREAM_GROUP, msg_id)
                     continue
 
-                # 4. Canonical envelope
-                event = build_event(unified, webhook_event, source)
+                # Step 4: Enrichment — inject device metadata if available
+                unified = await enrich(unified, repo)
 
-                # 5. Enrichment: inject device metadata (no-op if key absent)
-                event = await enrich(event, repo)
+                # Step 5: Autofill → build final FH2 request body
+                device_id = unified.get("device_id") or ""
+                if isinstance(unified.get("device"), dict):
+                    device_id = device_id or unified["device"].get("id", "")
+                device_info = (await repo.get_device(str(device_id))) if device_id else {}
 
-                ctx = dict(event)
-                if isinstance(template_body, dict) and "workflow_uuid" in template_body:
-                    ctx["workflow_uuid"] = template_body.get("workflow_uuid")
+                autofill_conf = {}
+                workflow_uuid = ""
+                if isinstance(fhcfg, dict):
+                    autofill_conf = fhcfg.get("autofill", {})
+                    tb = fhcfg.get("template_body", {})
+                    if isinstance(tb, dict):
+                        workflow_uuid = str(tb.get("workflow_uuid", ""))
 
-                body = render_obj(template_body, ctx)
+                filled, missing_fields = autofill(unified, device_info, autofill_conf)
+                body = build_fh2_body(filled, workflow_uuid=workflow_uuid)
+
+                if missing_fields:
+                    print(f"[worker] missing fields source={source} fields={missing_fields}")
 
                 status, text = await push_flighthub(endpoint, headers, body, retry_policy)
                 print(f"[worker] pushed msg_id={msg_id} source={source} http_status={status} name={body.get('name') if isinstance(body, dict) else 'n/a'}")
