@@ -115,7 +115,7 @@ export default function DevicePage() {
       {/* Table */}
       <Card
         title="Device Registry"
-        description="Stored as uw:device:{device_id} in Redis"
+        description="存储为 uw:device:{value}，其中 value 为 payload 中 Device ID Field 字段的实际内容"
         actions={
           <Button variant="secondary" size="sm" onClick={addRow}>
             <Plus className="w-3.5 h-3.5" /> Add Device
@@ -124,7 +124,7 @@ export default function DevicePage() {
       >
         {/* Table header */}
         <div className="grid grid-cols-[2fr_2fr_1.2fr_1.2fr_auto] gap-3 mb-2 px-1">
-          {['Device ID *', 'Model', 'Latitude', 'Longitude', ''].map((h) => (
+          {['Device ID 字段值 *', '备注 (Model)', 'Latitude', 'Longitude', ''].map((h) => (
             <span key={h} className="text-xs font-medium text-gray-500">{h}</span>
           ))}
         </div>
@@ -141,13 +141,13 @@ export default function DevicePage() {
               {row._editing ? (
                 <>
                   <Input
-                    placeholder="DJI-001"
+                    placeholder="e.g. 192.168.1.1 / SN-20240001"
                     value={row.device_id}
                     onChange={(e) => updateRow(i, 'device_id', e.target.value)}
                     disabled={!row._isNew}
                   />
                   <Input
-                    placeholder="Matrice 300 RTK"
+                    placeholder="备注（可选）"
                     value={row.model ?? ''}
                     onChange={(e) => updateRow(i, 'model', e.target.value)}
                   />
