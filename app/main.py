@@ -501,6 +501,37 @@ async def device_list(payload: dict[str, Any], x_admin_token: str | None = Heade
     return {"status": "ok", "devices": sorted(device_ids)}
 
 
+# ── GPS Field Map ─────────────────────────────────────────────────────────────
+
+@app.post("/admin/gpsfieldmap/get")
+async def gps_field_map_get(payload: dict[str, Any], x_admin_token: str | None = Header(default=None)):
+    """Get GPS field mapping config for a source.
+    Returns: {"lat": "field.path", "lng": "field.path", "alt": "field.path"}
+    """
+    global repo
+    assert repo is not None
+    _require_admin(x_admin_token)
+    source = payload.get("source", "").strip()
+    if not source:
+        return {"status": "error", "message": "missing source"}
+    cfg = await repo.get_gps_field_map(source)
+    return {"status": "ok", "gps_field_map": cfg}
+
+
+@app.post("/admin/gpsfieldmap/set")
+async def gps_field_map_set(payload: dict[str, Any], x_admin_token: str | None = Header(default=None)):
+    """Set GPS field mapping config for a source."""
+    global repo
+    assert repo is not None
+    _require_admin(x_admin_token)
+    source = payload.get("source", "").strip()
+    cfg = payload.get("gps_field_map")
+    if not source or cfg is None:
+        return {"status": "error", "message": "missing source or gps_field_map"}
+    await repo.set_gps_field_map(source, cfg)
+    return {"status": "ok", "source": source}
+
+
 # ════════════════════════════════════════════════════════════════════════════
 # DEBUG  — run full pipeline on a sample payload, return each stage output
 # ════════════════════════════════════════════════════════════════════════════
@@ -564,10 +595,12 @@ async def debug_run(payload: dict[str, Any], x_admin_token: str | None = Header(
             if isinstance(tb, dict):
                 workflow_uuid = str(tb.get("workflow_uuid", ""))
 
-        filled, missing = autofill(event, device_info, autofill_conf)
+        gps_field_map = await repo.get_gps_field_map(source)
+        filled, missing = autofill(event, device_info, autofill_conf, gps_field_map)
         final_body = build_fh2_body(filled, workflow_uuid=workflow_uuid)
         stages["final_body"] = final_body
         stages["missing"] = missing
+        stages["gps_field_map"] = gps_field_map
 
         return {"status": "ok", **stages}
 

@@ -49,6 +49,13 @@ class RedisRepo:
         """uw:device:{device_id}  →  device metadata for enrichment."""
         return f"uw:device:{device_id}"
 
+    @staticmethod
+    def _k_gps_field_map(source: str) -> str:
+        """uw:gpsfieldmap:{source}  →  GPS field mapping config.
+        Format: {"lat": "Event.Location.Latitude", "lng": "Event.Location.Longitude", "alt": "Event.Altitude"}
+        """
+        return f"uw:gpsfieldmap:{source}"
+
     # ── Existing methods (unchanged) ──────────────────────────────────────────
 
     async def get_mapping(self, source: str) -> dict:
@@ -101,4 +108,17 @@ class RedisRepo:
     async def set_device(self, device_id: str, info: dict) -> None:
         """Persist device metadata."""
         await self.redis.set(self._k_device(device_id), json.dumps(info, ensure_ascii=False))
+
+    async def get_gps_field_map(self, source: str) -> dict:
+        """Return GPS field mapping for *source*.  Empty dict if not configured.
+        Returns: {"lat": "field.path", "lng": "field.path", "alt": "field.path"}
+        """
+        raw = await self.redis.get(self._k_gps_field_map(source))
+        if not raw:
+            return {}
+        return json.loads(raw)
+
+    async def set_gps_field_map(self, source: str, cfg: dict) -> None:
+        """Persist GPS field mapping for *source*."""
+        await self.redis.set(self._k_gps_field_map(source), json.dumps(cfg, ensure_ascii=False))
 

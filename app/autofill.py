@@ -59,6 +59,7 @@ def autofill(
     mapped: dict[str, Any],
     device_info: dict[str, Any],
     autofill_conf: dict[str, Any],
+    gps_field_map: dict[str, str] | None = None,
 ) -> tuple[dict[str, Any], list[str]]:
     """Fill missing FH2 body fields, report what could not be filled.
 
@@ -75,6 +76,13 @@ def autofill(
                 "params.level":     3,
                 "params.creator":   "auto",
             }
+    gps_field_map : dict | None
+        Source-level GPS field mapping, e.g.::
+
+            {"lat": "Event.Location.Latitude", "lng": "Event.Location.Longitude"}
+
+        When provided, the worker will look up these flat-dict keys in *mapped*
+        and use them as GPS values if params.latitude/longitude are not yet filled.
 
     Returns
     -------
@@ -84,6 +92,7 @@ def autofill(
     """
     filled: dict[str, Any] = dict(mapped)
     missing: list[str] = []
+    gps_field_map = gps_field_map or {}
 
     loc = device_info.get("location") or {}
 
@@ -120,17 +129,31 @@ def autofill(
                 val = filled[alias]
                 break
 
-        # 3. Try device location
+        # 3. Try GPS field map (source-level config: field name → lat/lng/alt)
+        #    Allows GPS extraction when payload uses non-standard field names
+        #    and the source has no device_id field at all.
+        if val is None:
+            gps_key = None
+            if body_path == "params.latitude":
+                gps_key = gps_field_map.get("lat")
+            elif body_path == "params.longitude":
+                gps_key = gps_field_map.get("lng")
+            elif body_path == "params.altitude":
+                gps_key = gps_field_map.get("alt")
+            if gps_key and filled.get(gps_key) is not None:
+                val = filled[gps_key]
+
+        # 4. Try device location
         if val is None and body_path in _device_map:
             device_key = _device_map[body_path]
             if loc.get(device_key) is not None:
                 val = loc[device_key]
 
-        # 4. Try autofill_conf
+        # 5. Try autofill_conf
         if val is None and body_path in autofill_conf:
             val = autofill_conf[body_path]
 
-        # 5. Hardcoded default
+        # 6. Hardcoded default
         if val is None and hardcoded_default is not None:
             val = hardcoded_default
 

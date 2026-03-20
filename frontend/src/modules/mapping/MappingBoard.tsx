@@ -18,7 +18,7 @@
 import { useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Play, Save, RefreshCw, Sparkles, ChevronDown, ChevronRight } from 'lucide-react'
-import { debugService, mappingService, sourceService } from '@/services'
+import { debugService, mappingService, sourceService, deviceService } from '@/services'
 import { useMappingStore, useSourceStore, useUIStore } from '@/store'
 import { FieldList } from './components/FieldList'
 import { MappingRow, FH2_TARGET_FIELDS } from './components/MappingRow'
@@ -26,7 +26,7 @@ import { OutputPreview } from './components/OutputPreview'
 import { MissingPanel } from './components/MissingPanel'
 import { FH2ConfigPanel } from './components/FH2ConfigPanel'
 import { DevicePicker } from './components/DevicePicker'
-import type { DebugResult, FH2Body, MappingConfig, MappingRow as MappingRowType } from '@/types'
+import type { DebugResult, FH2Body, MappingConfig, MappingRow as MappingRowType, GpsFieldMap, DeviceInfo } from '@/types'
 
 // ─── Convert visual mapping  →  legacy MappingConfig ─────────────────────────
 // Visual: { "event.name": "name", "device.id": "params.device_id" }
@@ -96,6 +96,10 @@ export function MappingBoard({ wizardSourceId }: MappingBoardProps = {}) {
   const [debugResult, setDebugResult] = useState<DebugResult | null>(null)
   const [selectedField, setSelectedField] = useState<string | null>(null)
   const [showSampleEditor, setShowSampleEditor] = useState(false)
+  // Live state for MissingPanel coverage calculation
+  const [liveWorkflowUuid, setLiveWorkflowUuid] = useState('')
+  const [liveGpsFieldMap, setLiveGpsFieldMap] = useState<GpsFieldMap>({})
+  const [hasDeviceGps, setHasDeviceGps] = useState(false)
 
   // Load source list (not needed in wizard mode, but harmless)
   const { data: sources = [] } = useQuery({
@@ -103,6 +107,19 @@ export function MappingBoard({ wizardSourceId }: MappingBoardProps = {}) {
     queryFn: sourceService.list,
     enabled: !wizardSourceId,
   })
+
+  // Check if any device has GPS (for MissingPanel coverage)
+  useQuery({
+    queryKey: ['device-list'],
+    queryFn: async () => {
+      const ids = await deviceService.list()
+      if (!ids.length) return []
+      return Promise.all(ids.map((id) => deviceService.get(id)))
+    },
+    onSuccess: (devs: DeviceInfo[]) => {
+      setHasDeviceGps(devs.some((d: DeviceInfo) => d.location?.lat != null && d.location?.lng != null))
+    },
+  } as Parameters<typeof useQuery>[0])
 
   // Load existing mapping from Redis on source change
   useQuery({
@@ -258,10 +275,23 @@ export function MappingBoard({ wizardSourceId }: MappingBoardProps = {}) {
       )}
 
       {/* FH2 credentials panel */}
-      {activeSource && <FH2ConfigPanel sourceId={activeSource} />}
+      {activeSource && (
+        <FH2ConfigPanel
+          sourceId={activeSource}
+          onWorkflowUuidChange={setLiveWorkflowUuid}
+        />
+      )}
 
       {/* Device GPS fallback panel */}
-      {activeSource && <DevicePicker sourceId={activeSource} />}
+      {activeSource && (
+        <DevicePicker
+          sourceId={activeSource}
+          onGpsFieldMapChange={(cfg) => {
+            setLiveGpsFieldMap(cfg)
+            // detect if any device has GPS (updated after list query)
+          }}
+        />
+      )}
 
       {/* ── 3-column mapping board ──────────────────────────────────────── */}
       <div className="grid grid-cols-[220px_1fr_300px] gap-4 flex-1 min-h-0">
@@ -327,13 +357,18 @@ export function MappingBoard({ wizardSourceId }: MappingBoardProps = {}) {
         </div>
       </div>
 
-      {/* Missing fields panel */}
-      {(missing.length > 0 || normalizedFields.length > 0) && activeSource && (
+      {/* Missing fields panel — always show when source is selected */}
+      {activeSource && (
         <div className="border border-gray-200 rounded-xl bg-white p-4">
           <h3 className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-3">
             Required Fields Status
           </h3>
-          <MissingPanel missing={debugResult?.missing ?? missing} />
+          <MissingPanel
+            missing={debugResult?.missing ?? (normalizedFields.length > 0 ? missing : undefined)}
+            workflowUuid={liveWorkflowUuid}
+            gpsFieldMap={liveGpsFieldMap}
+            hasDeviceGps={hasDeviceGps}
+          />
         </div>
       )}
     </div>

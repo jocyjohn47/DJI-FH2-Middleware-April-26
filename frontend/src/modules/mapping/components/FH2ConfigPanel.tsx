@@ -53,9 +53,11 @@ function TokenInput({
 
 interface FH2ConfigPanelProps {
   sourceId: string
+  /** Called whenever workflowUuid changes so parent can update MissingPanel */
+  onWorkflowUuidChange?: (uuid: string) => void
 }
 
-export function FH2ConfigPanel({ sourceId }: FH2ConfigPanelProps) {
+export function FH2ConfigPanel({ sourceId, onWorkflowUuidChange }: FH2ConfigPanelProps) {
   const { addToast } = useUIStore()
   const qc = useQueryClient()
   const [open, setOpen] = useState(true)
@@ -68,8 +70,13 @@ export function FH2ConfigPanel({ sourceId }: FH2ConfigPanelProps) {
   })
   const [showExtractor, setShowExtractor] = useState(false)
 
-  const set = (patch: Partial<FH2State>) =>
-    setState((prev) => ({ ...prev, ...patch }))
+  const set = (patch: Partial<FH2State>) => {
+    setState((prev) => {
+      const next = { ...prev, ...patch }
+      if ('workflowUuid' in patch) onWorkflowUuidChange?.(patch.workflowUuid ?? '')
+      return next
+    })
+  }
 
   // Load
   useQuery({
@@ -77,13 +84,15 @@ export function FH2ConfigPanel({ sourceId }: FH2ConfigPanelProps) {
     queryFn: () => egressService.get(sourceId),
     enabled: !!sourceId,
     onSuccess: (cfg: EgressConfig) => {
+      const wfUuid = (cfg.template_body?.['workflow_uuid'] as string) ?? ''
       setState({
         endpoint:    cfg.endpoint ?? DEFAULT_ENDPOINT,
         userToken:   cfg.headers?.['X-User-Token'] ?? '',
         projectUuid: cfg.headers?.['x-project-uuid'] ?? '',
-        workflowUuid: (cfg.template_body?.['workflow_uuid'] as string) ?? '',
+        workflowUuid: wfUuid,
         rawPaste: '',
       })
+      onWorkflowUuidChange?.(wfUuid)
     },
   } as Parameters<typeof useQuery>[0])
 

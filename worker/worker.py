@@ -126,7 +126,10 @@ async def run():
                     if isinstance(tb, dict):
                         workflow_uuid = str(tb.get("workflow_uuid", ""))
 
-                filled, missing_fields = autofill(unified, device_info, autofill_conf)
+                # GPS field map (source-level, allows GPS without device_id)
+                gps_field_map = await repo.get_gps_field_map(source)
+
+                filled, missing_fields = autofill(unified, device_info, autofill_conf, gps_field_map)
                 body = build_fh2_body(filled, workflow_uuid=workflow_uuid)
 
                 if missing_fields:
