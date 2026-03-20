@@ -104,10 +104,15 @@ export const deviceService = {
 // ─── Debug pipeline ───────────────────────────────────────────────────────────
 
 export const debugService = {
-  async run(sourceId: string, samplePayload: Record<string, unknown>): Promise<DebugResult> {
+  async run(
+    sourceId: string,
+    samplePayload: Record<string, unknown>,
+    mappingOverride?: Record<string, unknown>,
+  ): Promise<DebugResult> {
     const { data } = await apiClient.post('/admin/debug/run', {
       source: sourceId,
       sample_payload: samplePayload,
+      ...(mappingOverride ? { mapping_override: mappingOverride } : {}),
     })
     return data as DebugResult
   },

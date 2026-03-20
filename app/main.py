@@ -539,8 +539,11 @@ async def device_id_field_set(payload: dict[str, Any], x_admin_token: str | None
 async def debug_run(payload: dict[str, Any], x_admin_token: str | None = Header(default=None)):
     """Dry-run the full processing pipeline without writing to Redis Stream.
 
-    Input:  { source, sample_payload }
+    Input:  { source, sample_payload, mapping_override? }
     Output: { raw, flat, normalized, mapped, event, final_body, missing, normalized_fields }
+
+    mapping_override: optional MappingConfig dict — when provided, overrides the Redis-stored
+    mapping so the frontend can preview unsaved visual mappings in real-time.
     """
     global repo
     assert repo is not None
@@ -556,6 +559,8 @@ async def debug_run(payload: dict[str, Any], x_admin_token: str | None = Header(
 
     source = payload.get("source") or settings.DEFAULT_SOURCE
     raw: dict = payload.get("sample_payload") or {}
+    # mapping_override: if provided by frontend (unsaved visual mapping), use it directly
+    mapping_override: dict | None = payload.get("mapping_override") or None
 
     stages: dict[str, Any] = {"source": source, "raw": raw}
 
@@ -571,7 +576,9 @@ async def debug_run(payload: dict[str, Any], x_admin_token: str | None = Header(
         stages["normalized_fields"] = get_normalized_fields(flat, adapter_conf)
 
         # Stage 3 — mapping
-        mapping_conf = await repo.get_mapping(source)
+        # Use override when provided (unsaved visual mapping from frontend),
+        # otherwise fall back to the saved Redis config.
+        mapping_conf = mapping_override if mapping_override else await repo.get_mapping(source)
         received_at = int(_time.time())
         mapped = apply_mappings(raw, source, mapping_conf, received_at, flat_event=normalized)
         stages["mapped"] = mapped

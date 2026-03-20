@@ -148,9 +148,20 @@ export function MappingBoard({ wizardSourceId }: MappingBoardProps = {}) {
     mutationFn: async () => {
       // Re-read store state inside the mutationFn so it always gets the latest value
       const latestPayload = useMappingStore.getState().samplePayload
+      const latestMapping = useMappingStore.getState().mapping
+      const latestNormalized = useMappingStore.getState().normalizedFields
+
       let parsed: Record<string, unknown> = {}
       try { parsed = JSON.parse(latestPayload) } catch { parsed = {} }
-      return debugService.run(activeSource, parsed)
+
+      // Pass the current (potentially unsaved) visual mapping as override
+      // so the preview reflects exactly what the user sees on screen,
+      // not the last-saved Redis config.
+      const mappingOverride = Object.keys(latestMapping).length > 0
+        ? visualToLegacy(latestMapping, latestNormalized) as unknown as Record<string, unknown>
+        : undefined
+
+      return debugService.run(activeSource, parsed, mappingOverride)
     },
     onSuccess: (result) => {
       setDebugResult(result)
