@@ -52,39 +52,80 @@ interface WizardStore {
   canProceed: () => boolean
 }
 
-export const useWizardStore = create<WizardStore>((set, get) => ({
-  active: false,
-  sourceId: '',
-  currentStep: 'create_source',
-  completedSteps: new Set(),
+// Persisted wizard state (survives page refresh) — stored as plain arrays for JSON serialization
+interface WizardStorePersisted {
+  active: boolean
+  sourceId: string
+  currentStep: WizardStep
+  completedStepsArr: WizardStep[]   // serializable form of Set<WizardStep>
+}
 
-  startWizard: (sourceId = '') =>
-    set({
-      active: true,
-      sourceId,
-      currentStep: sourceId ? 'configure_auth' : 'create_source',
-      completedSteps: sourceId ? new Set<WizardStep>(['create_source']) : new Set(),
+export const useWizardStore = create<WizardStore>()(
+  persist(
+    (set, get) => ({
+      active: false,
+      sourceId: '',
+      currentStep: 'create_source',
+      completedSteps: new Set<WizardStep>(),
+
+      startWizard: (sourceId = '') =>
+        set((state) => {
+          // If opening an existing source (same sourceId or previously completed), preserve completed steps
+          const isSameSource = sourceId && state.sourceId === sourceId
+          const existingCompleted = isSameSource ? state.completedSteps : new Set<WizardStep>()
+          // For any source that already exists, always mark create_source as completed
+          const completedSteps = sourceId
+            ? new Set<WizardStep>([...existingCompleted, 'create_source'])
+            : new Set<WizardStep>()
+          return {
+            active: true,
+            sourceId,
+            currentStep: sourceId ? (isSameSource ? state.currentStep : 'configure_auth') : 'create_source',
+            completedSteps,
+          }
+        }),
+
+      completeStep: (step) => {
+        const { completedSteps } = get()
+        const next = WIZARD_ORDER[WIZARD_ORDER.indexOf(step) + 1]
+        set({
+          completedSteps: new Set([...completedSteps, step]),
+          currentStep: next ?? step,
+        })
+      },
+
+      goToStep: (step) => set({ currentStep: step }),
+
+      closeWizard: () =>
+        set({ active: false, sourceId: '', currentStep: 'create_source', completedSteps: new Set() }),
+
+      canProceed: () => {
+        const { currentStep, completedSteps } = get()
+        return completedSteps.has(currentStep)
+      },
     }),
-
-  completeStep: (step) => {
-    const { completedSteps } = get()
-    const next = WIZARD_ORDER[WIZARD_ORDER.indexOf(step) + 1]
-    set({
-      completedSteps: new Set([...completedSteps, step]),
-      currentStep: next ?? step,
-    })
-  },
-
-  goToStep: (step) => set({ currentStep: step }),
-
-  closeWizard: () =>
-    set({ active: false, sourceId: '', currentStep: 'create_source', completedSteps: new Set() }),
-
-  canProceed: () => {
-    const { currentStep, completedSteps } = get()
-    return completedSteps.has(currentStep)
-  },
-}))
+    {
+      name: 'fh2-wizard-state',
+      // Serialize Set → array and back
+      partialize: (s) => ({
+        active: s.active,
+        sourceId: s.sourceId,
+        currentStep: s.currentStep,
+        completedStepsArr: [...s.completedSteps],
+      } as WizardStorePersisted),
+      merge: (persisted, current) => {
+        const p = persisted as WizardStorePersisted
+        return {
+          ...current,
+          active: p.active ?? false,
+          sourceId: p.sourceId ?? '',
+          currentStep: p.currentStep ?? 'create_source',
+          completedSteps: new Set<WizardStep>(p.completedStepsArr ?? []),
+        }
+      },
+    }
+  )
+)
 
 // ─── UI / notification store ──────────────────────────────────────────────────
 export type ToastType = 'success' | 'error' | 'info'

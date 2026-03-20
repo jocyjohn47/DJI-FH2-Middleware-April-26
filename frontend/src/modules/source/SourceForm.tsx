@@ -77,6 +77,8 @@ export function SourceAuthForm({ sourceId }: { sourceId: string }) {
     queryKey: ['auth', sourceId],
     queryFn: () => authService.get(sourceId),
     enabled: !!sourceId,
+    // staleTime: 0 确保每次 sourceId 变化都重新拉取
+    staleTime: 0,
   })
 
   useEffect(() => {

@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import { useForm } from 'react-hook-form'
 import { useMutation, useQuery } from '@tanstack/react-query'
 import { egressService, tokenService } from '@/services'
@@ -95,12 +95,17 @@ export function EgressConfigPanel({ sourceId }: { sourceId: string }) {
       },
     })
 
-  // Load existing config
-  useQuery({
+  // Load existing config — use useEffect instead of onSuccess (TanStack Query v5 removed onSuccess)
+  const { data: existingConfig } = useQuery({
     queryKey: ['egress', sourceId],
     queryFn: () => egressService.get(sourceId),
     enabled: !!sourceId,
-    onSuccess: (cfg: EgressConfig) => {
+    staleTime: 0,
+  })
+
+  useEffect(() => {
+    if (existingConfig) {
+      const cfg = existingConfig
       reset({
         endpoint: cfg.endpoint,
         userToken:    (cfg.headers['X-User-Token']  ?? ''),
@@ -111,8 +116,8 @@ export function EgressConfigPanel({ sourceId }: { sourceId: string }) {
         backoff: cfg.retry_policy.backoff,
         rawPaste: '',
       })
-    },
-  } as Parameters<typeof useQuery>[0])
+    }
+  }, [existingConfig, reset])
 
   // Save
   const { mutate: save, isPending } = useMutation({

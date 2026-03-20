@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { Plus, Trash2, Save, Info } from 'lucide-react'
 import { adapterService, sourceService } from '@/services'
@@ -51,15 +51,19 @@ export default function AdapterPage() {
   })
 
   // Load adapter config when source selected
-  useQuery({
+  const { data: adapterConfig } = useQuery({
     queryKey: ['adapter', selected],
     queryFn: () => adapterService.get(selected),
     enabled: !!selected,
-    onSuccess: (cfg: AdapterConfig) => {
-      const r = configToRows(cfg)
+    staleTime: 0,
+  })
+
+  useEffect(() => {
+    if (adapterConfig) {
+      const r = configToRows(adapterConfig)
       setRows(r.length ? r : [])
-    },
-  } as Parameters<typeof useQuery>[0])
+    }
+  }, [adapterConfig])
 
   // Save mutation
   const { mutate: save, isPending } = useMutation({

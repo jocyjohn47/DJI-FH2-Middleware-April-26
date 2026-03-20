@@ -1,3 +1,4 @@
+import { useEffect } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { useNavigate } from 'react-router-dom'
 import { sourceService, authService, mappingService, egressService } from '@/services'
@@ -21,14 +22,18 @@ function statusIcon(s: StepStatus) {
 
 export function Dashboard() {
   const navigate = useNavigate()
-  const { setSources, sources, setSelected } = useSourceStore()
+  const { setSources, sources } = useSourceStore()
   const { startWizard } = useWizardStore()
 
-  const { isLoading } = useQuery({
+  const { isLoading, data: sourceListData } = useQuery({
     queryKey: ['sources'],
     queryFn: sourceService.list,
-    onSuccess: setSources,
-  } as Parameters<typeof useQuery>[0])
+    staleTime: 0,
+  })
+
+  useEffect(() => {
+    if (sourceListData) setSources(sourceListData)
+  }, [sourceListData, setSources])
 
   // Per-source pipeline health
   const pipelineQueries = useQuery({
@@ -70,7 +75,7 @@ export function Dashboard() {
         }),
       )
     },
-  } as Parameters<typeof useQuery>[0])
+  })
 
   const pipelines: SourcePipeline[] = (pipelineQueries.data as SourcePipeline[] | undefined) ?? []
 
@@ -161,7 +166,7 @@ export function Dashboard() {
                 <Button
                   variant="ghost"
                   size="sm"
-                  onClick={() => { setSelected(p.sourceId); startWizard(p.sourceId); navigate('/wizard') }}
+                  onClick={() => { startWizard(p.sourceId); navigate('/wizard') }}
                 >
                   Configure <ArrowRight className="w-3.5 h-3.5" />
                 </Button>

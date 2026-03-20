@@ -1,6 +1,6 @@
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { Plus, Trash2, Edit2, X, Check, MapPin } from 'lucide-react'
+import { Plus, Trash2, Edit2, X, Check, MapPin, Fingerprint } from 'lucide-react'
 import { deviceService } from '@/services'
 import { useUIStore } from '@/store'
 import { Card } from '@/components/ui/Card'
@@ -31,18 +31,22 @@ export default function DevicePage() {
   const qc = useQueryClient()
   const [rows, setRows] = useState<DeviceRow[]>([])
 
-  // Load device list + details
-  useQuery({
+  // Load device list + details (TanStack Query v5: use useEffect instead of onSuccess)
+  const { data: deviceQueryData } = useQuery({
     queryKey: ['device-list'],
     queryFn: async () => {
       const ids = await deviceService.list()
       const details = await Promise.all(ids.map((id) => deviceService.get(id)))
       return details.map((d, i) => ({ ...d, device_id: d.device_id || ids[i] }))
     },
-    onSuccess: (data: DeviceInfo[]) => {
-      setRows(data.map((d) => ({ ...d, _editing: false, _isNew: false })))
-    },
-  } as Parameters<typeof useQuery>[0])
+    staleTime: 0,
+  })
+
+  useEffect(() => {
+    if (deviceQueryData) {
+      setRows(deviceQueryData.map((d) => ({ ...d, _editing: false, _isNew: false })))
+    }
+  }, [deviceQueryData])
 
   // Save one device
   const { mutate: saveOne } = useMutation({
@@ -103,8 +107,9 @@ export default function DevicePage() {
       <div>
         <h1 className="text-xl font-semibold text-gray-900">Devices</h1>
         <p className="text-sm text-gray-500 mt-1">
-          Register device metadata for GPS enrichment. When a webhook message contains a
-          matching <code className="font-mono text-xs">device_id</code>, location data is automatically injected.
+          Register device GPS coordinates here. The worker identifies devices using the
+          <strong className="font-semibold"> Device ID Field</strong> configured per-source in the Visual Mapping page,
+          then injects the matching fixed GPS coordinates into <code className="font-mono text-xs">params.latitude</code> / <code className="font-mono text-xs">params.longitude</code>.
         </p>
       </div>
 
@@ -222,14 +227,27 @@ export default function DevicePage() {
       </Card>
 
       {/* GPS info card */}
-      <Card title="How Enrichment Works">
-        <div className="flex items-start gap-3 text-sm text-gray-600">
-          <MapPin className="w-4 h-4 text-brand-600 mt-0.5 shrink-0" />
-          <div className="space-y-1">
-            <p>When the worker processes a message, it reads <code className="font-mono text-xs bg-gray-100 px-1 rounded">device_id</code> from the mapped event.</p>
-            <p>If a matching device record exists in Redis, the worker injects:</p>
-            <pre className="text-xs font-mono bg-gray-900 text-emerald-400 p-2 rounded mt-2">{`event["location"] = { "lat": ..., "lng": ... }
-event["_device"]  = { "model": ..., "site": ... }`}</pre>
+      <Card title="How GPS Enrichment Works">
+        <div className="space-y-3 text-sm text-gray-600">
+          <div className="flex items-start gap-3">
+            <Fingerprint className="w-4 h-4 text-indigo-600 mt-0.5 shrink-0" />
+            <div>
+              <p className="font-medium text-gray-700 mb-1">Step 1 — Device ID Field (per source)</p>
+              <p>In the Visual Mapping page, configure which flattened payload field holds the device identifier.
+                e.g. if you set <code className="font-mono text-xs bg-gray-100 px-1 rounded">deviceSN</code>,
+                the worker reads <code className="font-mono text-xs bg-gray-100 px-1 rounded">payload.deviceSN</code> to get the actual device ID value.</p>
+            </div>
+          </div>
+          <div className="flex items-start gap-3">
+            <MapPin className="w-4 h-4 text-teal-600 mt-0.5 shrink-0" />
+            <div>
+              <p className="font-medium text-gray-700 mb-1">Step 2 — Registry Lookup (this page)</p>
+              <p>The resolved device ID value is matched against the <strong>Device ID</strong> column here.
+                If found, the GPS coordinates are injected into the FH2 body:</p>
+              <pre className="text-xs font-mono bg-gray-900 text-emerald-400 p-2 rounded mt-2">{`params.latitude  = device.location.lat
+params.longitude = device.location.lng`}</pre>
+              <p className="mt-2 text-gray-400 text-xs">The <strong>Device ID</strong> column must exactly match the actual payload value, not a field path.</p>
+            </div>
           </div>
         </div>
       </Card>

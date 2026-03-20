@@ -1,3 +1,4 @@
+import { useEffect } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { sourceService } from '@/services'
 import { useSourceStore, useUIStore } from '@/store'
@@ -9,11 +10,16 @@ export default function SourcesPage() {
   const { addToast } = useUIStore()
   const qc = useQueryClient()
 
-  useQuery({
+  const { data: sourceList } = useQuery({
     queryKey: ['sources'],
     queryFn: sourceService.list,
-    onSuccess: setSources,
-  } as Parameters<typeof useQuery>[0])
+    staleTime: 0,
+  })
+
+  // Sync to store whenever query data changes
+  useEffect(() => {
+    if (sourceList) setSources(sourceList)
+  }, [sourceList, setSources])
 
   const { mutate: deleteSource } = useMutation({
     mutationFn: (id: string) => sourceService.delete(id),

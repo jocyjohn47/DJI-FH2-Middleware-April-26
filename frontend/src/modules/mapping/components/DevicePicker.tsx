@@ -15,7 +15,7 @@
  *     uw:device:{device_id}  — when the worker resolves a device_id (via the
  *     field above or the default `device_id` key), it injects lat/lng from here.
  */
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { MapPin, Plus, Check, X, Edit2, ChevronDown, ChevronRight, Save, Fingerprint } from 'lucide-react'
 import { deviceService, deviceIdFieldService } from '@/services'
@@ -44,16 +44,20 @@ export function DevicePicker({ sourceId, onDeviceIdFieldChange }: DevicePickerPr
   const [deviceIdField, setDeviceIdField] = useState('')
   const [fieldDirty, setFieldDirty] = useState(false)
 
-  useQuery({
+  const { data: deviceIdFieldData } = useQuery({
     queryKey: ['device-id-field', sourceId],
     queryFn: () => deviceIdFieldService.get(sourceId),
     enabled: !!sourceId,
-    onSuccess: (field: string) => {
-      setDeviceIdField(field)
-      onDeviceIdFieldChange?.(field)
+    staleTime: 0,
+  })
+
+  useEffect(() => {
+    if (deviceIdFieldData !== undefined) {
+      setDeviceIdField(deviceIdFieldData)
+      onDeviceIdFieldChange?.(deviceIdFieldData)
       setFieldDirty(false)
-    },
-  } as Parameters<typeof useQuery>[0])
+    }
+  }, [deviceIdFieldData]) // eslint-disable-line react-hooks/exhaustive-deps
 
   const { mutate: saveField, isPending: savingField } = useMutation({
     mutationFn: () => deviceIdFieldService.set(sourceId, deviceIdField),
@@ -154,19 +158,47 @@ export function DevicePicker({ sourceId, onDeviceIdFieldChange }: DevicePickerPr
       {open && (
         <div className="p-4 space-y-5">
 
+          {/* ── How it works ─────────────────────────────────────────────── */}
+          <div className="bg-blue-50 border border-blue-200 rounded-lg px-3 py-2.5 text-xs text-blue-800">
+            <p className="font-semibold mb-1.5">工作原理：三步注入 GPS</p>
+            <ol className="space-y-1.5 list-none">
+              <li className="flex items-start gap-2">
+                <span className="shrink-0 w-4 h-4 bg-blue-600 text-white rounded-full flex items-center justify-center font-bold text-[10px]">1</span>
+                <span>
+                  <strong>Device ID Field</strong>（下方配置）确定 payload 中哪个字段是设备标识符。
+                  例如配置为 <code className="bg-blue-100 px-1 rounded font-mono">deviceSN</code>，
+                  则从 payload 读取 <code className="bg-blue-100 px-1 rounded font-mono">payload.deviceSN</code> 的实际值（如 <code className="bg-blue-100 px-1 rounded font-mono">DJI-001</code>）。
+                </span>
+              </li>
+              <li className="flex items-start gap-2">
+                <span className="shrink-0 w-4 h-4 bg-blue-600 text-white rounded-full flex items-center justify-center font-bold text-[10px]">2</span>
+                <span>
+                  <strong>Device Registry</strong>（下方表格）将设备 ID 值与固定 GPS 坐标对应。
+                  例如 ID = <code className="bg-blue-100 px-1 rounded font-mono">DJI-001</code> →
+                  lat = <code className="bg-blue-100 px-1 rounded font-mono">22.5431</code>，lng = <code className="bg-blue-100 px-1 rounded font-mono">114.0579</code>。
+                </span>
+              </li>
+              <li className="flex items-start gap-2">
+                <span className="shrink-0 w-4 h-4 bg-blue-600 text-white rounded-full flex items-center justify-center font-bold text-[10px]">3</span>
+                <span>
+                  <strong>自动注入</strong>：Worker 处理消息时，若 <code className="bg-blue-100 px-1 rounded font-mono">params.latitude</code> /
+                  <code className="bg-blue-100 px-1 rounded font-mono ml-1">params.longitude</code> 尚未映射，
+                  则用查找结果自动填充，无需在 payload 中包含 GPS 字段。
+                </span>
+              </li>
+            </ol>
+          </div>
+
           {/* ── A. Device ID Field Config ─────────────────────────────────── */}
           <div>
             <div className="flex items-center gap-1.5 mb-1.5">
               <Fingerprint className="w-3.5 h-3.5 text-indigo-500" />
-              <span className="text-xs font-semibold text-gray-700">Device ID Field</span>
+              <span className="text-xs font-semibold text-gray-700">步骤 1：Device ID Field</span>
+              <span className="text-xs text-gray-400">— payload 中哪个字段是设备标识符</span>
             </div>
-            <p className="text-xs text-gray-400 mb-3">
-              Specify which <strong>flattened payload field</strong> holds the device identifier used
-              to look up GPS coordinates.  Leave blank to use the default
-              <code className="font-mono bg-gray-100 px-1 mx-0.5 rounded">device_id</code> key.
-              Example: <code className="font-mono bg-gray-100 px-1 rounded">deviceSN</code>,{' '}
-              <code className="font-mono bg-gray-100 px-1 rounded">camera.id</code>,{' '}
-              <code className="font-mono bg-gray-100 px-1 rounded">Event.DeviceSN</code>.
+            <p className="text-xs text-gray-400 mb-2">
+              填写 payload 展开后（flattened）的字段路径。空白则默认使用
+              <code className="font-mono bg-gray-100 px-1 mx-0.5 rounded">device_id</code> 字段。
             </p>
 
             <div className="flex items-center gap-2">
@@ -175,7 +207,7 @@ export function DevicePicker({ sourceId, onDeviceIdFieldChange }: DevicePickerPr
                   'flex-1 text-xs font-mono border rounded-lg px-2.5 py-1.5 focus:outline-none focus:ring-2 focus:ring-brand-500 transition-colors',
                   deviceIdField ? 'border-indigo-300 bg-indigo-50' : 'border-gray-300',
                 ].join(' ')}
-                placeholder="e.g. deviceSN  or  Event.DeviceId  (blank = use device_id)"
+                placeholder="e.g. deviceSN  /  camera.sn  /  Event.DeviceId  （空白 = device_id）"
                 value={deviceIdField}
                 onChange={(e) => {
                   setDeviceIdField(e.target.value)
@@ -195,24 +227,27 @@ export function DevicePicker({ sourceId, onDeviceIdFieldChange }: DevicePickerPr
                 </button>
               )}
             </div>
+
+            {deviceIdField && (
+              <p className="text-xs text-indigo-600 mt-1.5">
+                ✓ Worker 将读取 payload 中 <code className="font-mono bg-indigo-50 px-1 rounded">{deviceIdField}</code> 字段的值作为设备 ID
+              </p>
+            )}
           </div>
 
           {/* divider */}
           <div className="border-t border-gray-100" />
 
-          {/* ── B. Device GPS Fallback ────────────────────────────────────── */}
+          {/* ── B. Device GPS Registry ───────────────────────────────────── */}
           <div>
             <div className="flex items-center gap-1.5 mb-1.5">
               <MapPin className="w-3.5 h-3.5 text-teal-500" />
-              <span className="text-xs font-semibold text-gray-700">Device Registry</span>
-              <span className="text-xs text-gray-400">— fixed GPS by device ID</span>
+              <span className="text-xs font-semibold text-gray-700">步骤 2：Device Registry</span>
+              <span className="text-xs text-gray-400">— 设备 ID 值 → 固定 GPS 坐标</span>
             </div>
             <p className="text-xs text-gray-400 mb-3">
-              Register devices with fixed GPS coordinates.  When the worker resolves
-              a device identifier (via the field above), it looks up the matching record
-              here and injects <code className="font-mono bg-gray-100 px-1 rounded">params.latitude</code>
-              {' / '}<code className="font-mono bg-gray-100 px-1 rounded">params.longitude</code> if
-              they are still missing after mapping.
+              注册设备 ID 值（即 payload 中该字段的实际内容）与固定经纬度的对应关系。
+              Device ID 列应与 payload 中的实际值完全匹配。
             </p>
 
             {devices.length > 0 && (
@@ -363,9 +398,12 @@ export function DevicePicker({ sourceId, onDeviceIdFieldChange }: DevicePickerPr
           {/* hint when no devices with GPS and no field configured */}
           {!hasDeviceGps && !deviceIdField && (
             <p className="text-xs text-amber-600 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
-              ⚠ No GPS fallback configured. Register devices with GPS coordinates above,
-              and optionally set a Device ID Field so the worker can match incoming events
-              to device records.
+              ⚠ 尚未配置 GPS 注入。请先在步骤 1 填写 Device ID Field，然后在步骤 2 注册设备与对应 GPS 坐标。
+            </p>
+          )}
+          {hasDeviceGps && !deviceIdField && (
+            <p className="text-xs text-amber-600 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
+              ℹ 已注册设备 GPS，但未配置 Device ID Field。请在步骤 1 填写 payload 中的设备标识字段，否则 Worker 无法自动匹配。
             </p>
           )}
         </div>

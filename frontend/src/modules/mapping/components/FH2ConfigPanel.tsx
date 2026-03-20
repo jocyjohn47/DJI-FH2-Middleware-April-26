@@ -3,7 +3,7 @@
  * Quick-set: workflow_uuid, X-User-Token, x-project-uuid, creator
  * Reads/writes via /admin/flighthub/get|set
  */
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { Eye, EyeOff, Save, ChevronDown, ChevronRight, Wand2 } from 'lucide-react'
 import { egressService, tokenService } from '@/services'
@@ -79,22 +79,26 @@ export function FH2ConfigPanel({ sourceId, onWorkflowUuidChange }: FH2ConfigPane
   }
 
   // Load
-  useQuery({
+  const { data: egressData } = useQuery({
     queryKey: ['egress', sourceId],
     queryFn: () => egressService.get(sourceId),
     enabled: !!sourceId,
-    onSuccess: (cfg: EgressConfig) => {
-      const wfUuid = (cfg.template_body?.['workflow_uuid'] as string) ?? ''
-      setState({
-        endpoint:    cfg.endpoint ?? DEFAULT_ENDPOINT,
-        userToken:   cfg.headers?.['X-User-Token'] ?? '',
-        projectUuid: cfg.headers?.['x-project-uuid'] ?? '',
-        workflowUuid: wfUuid,
-        rawPaste: '',
-      })
-      onWorkflowUuidChange?.(wfUuid)
-    },
-  } as Parameters<typeof useQuery>[0])
+    staleTime: 0,
+  })
+
+  useEffect(() => {
+    if (!egressData) return
+    const cfg = egressData
+    const wfUuid = (cfg.template_body?.['workflow_uuid'] as string) ?? ''
+    setState({
+      endpoint:    cfg.endpoint ?? DEFAULT_ENDPOINT,
+      userToken:   cfg.headers?.['X-User-Token'] ?? '',
+      projectUuid: cfg.headers?.['x-project-uuid'] ?? '',
+      workflowUuid: wfUuid,
+      rawPaste: '',
+    })
+    onWorkflowUuidChange?.(wfUuid)
+  }, [egressData]) // eslint-disable-line react-hooks/exhaustive-deps
 
   // Save
   const { mutate: save, isPending } = useMutation({

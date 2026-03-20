@@ -15,7 +15,7 @@
  * 4. Click "Preview" → re-run debug with current mapping → right panel updates
  * 5. Click "Save" → POST /admin/mapping/set (converts visual mapping to legacy list format)
  */
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Play, Save, RefreshCw, Sparkles, ChevronDown, ChevronRight } from 'lucide-react'
 import { debugService, mappingService, sourceService, deviceService } from '@/services'
@@ -26,6 +26,7 @@ import { OutputPreview } from './components/OutputPreview'
 import { MissingPanel } from './components/MissingPanel'
 import { FH2ConfigPanel } from './components/FH2ConfigPanel'
 import { DevicePicker } from './components/DevicePicker'
+import { ApiFormatPanel } from './components/ApiFormatPanel'
 import type { DebugResult, FH2Body, MappingConfig, MappingRow as MappingRowType, DeviceInfo } from '@/types'
 
 // ─── Convert visual mapping  →  legacy MappingConfig ─────────────────────────
@@ -109,33 +110,38 @@ export function MappingBoard({ wizardSourceId }: MappingBoardProps = {}) {
   })
 
   // Check if any device has GPS (for MissingPanel coverage)
-  useQuery({
+  const { data: deviceList = [] } = useQuery({
     queryKey: ['device-list'],
-    queryFn: async () => {
+    queryFn: async (): Promise<DeviceInfo[]> => {
       const ids = await deviceService.list()
       if (!ids.length) return []
       return Promise.all(ids.map((id) => deviceService.get(id)))
     },
-    onSuccess: (devs: DeviceInfo[]) => {
-      setHasDeviceGps(devs.some((d: DeviceInfo) => d.location?.lat != null && d.location?.lng != null))
-    },
-  } as Parameters<typeof useQuery>[0])
+  })
+
+  useEffect(() => {
+    setHasDeviceGps(deviceList.some((d) => d.location?.lat != null && d.location?.lng != null))
+  }, [deviceList])
 
   // Load existing mapping from Redis on source change
-  useQuery({
+  const { data: existingMapping } = useQuery({
     queryKey: ['mapping', activeSource],
     queryFn: () => mappingService.get(activeSource),
     enabled: !!activeSource,
-    onSuccess: (cfg: MappingConfig) => {
-      // Convert legacy → visual mapping
-      const visual: Record<string, string> = {}
-      for (const row of cfg.mappings ?? []) {
-        const src = row.src?.replace(/^\$\./, '')
-        if (src && row.dst) visual[src] = row.dst
-      }
-      if (Object.keys(visual).length > 0) setMapping(visual)
-    },
-  } as Parameters<typeof useQuery>[0])
+    staleTime: 0,
+  })
+
+  useEffect(() => {
+    if (!existingMapping) return
+    // Convert legacy → visual mapping
+    const visual: Record<string, string> = {}
+    for (const row of existingMapping.mappings ?? []) {
+      const src = row.src?.replace(/^\$\./, '')
+      if (src && row.dst) visual[src] = row.dst
+    }
+    if (Object.keys(visual).length > 0) setMapping(visual)
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [existingMapping])
 
   // Debug run mutation — use a variable ref to avoid stale closure on samplePayload
   const { mutate: runDebug, isPending: running } = useMutation({
@@ -350,14 +356,19 @@ export function MappingBoard({ wizardSourceId }: MappingBoardProps = {}) {
           </div>
         </div>
 
-        {/* RIGHT — output preview */}
-        <div className="border border-gray-200 rounded-xl bg-white p-3 flex flex-col min-h-0 max-h-[600px]">
-          <h3 className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-2">
-            FH2 Output
-          </h3>
-          <OutputPreview body={debugResult?.final_body as FH2Body | undefined} />
+        {/* RIGHT — output preview + API format reference */}
+        <div className="flex flex-col gap-3 min-h-0 max-h-[600px] overflow-y-auto">
+          <div className="border border-gray-200 rounded-xl bg-white p-3 flex flex-col min-h-[200px]">
+            <h3 className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-2">
+              FH2 Output
+            </h3>
+            <OutputPreview body={debugResult?.final_body as FH2Body | undefined} />
+          </div>
         </div>
       </div>
+
+      {/* FH2 API format reference */}
+      <ApiFormatPanel />
 
       {/* Missing fields panel — always show when source is selected */}
       {activeSource && (
