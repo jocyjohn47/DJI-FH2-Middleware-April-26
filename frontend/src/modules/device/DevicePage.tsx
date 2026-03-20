@@ -18,7 +18,6 @@ interface DeviceRow extends DeviceInfo {
 const EMPTY_DEVICE = (): DeviceRow => ({
   device_id: '',
   model: '',
-  site: '',
   location: { lat: null, lng: null, alt: null },
   _editing: true,
   _isNew: true,
@@ -31,7 +30,7 @@ export default function DevicePage() {
   const qc = useQueryClient()
   const [rows, setRows] = useState<DeviceRow[]>([])
 
-  // Load device list + details (TanStack Query v5: use useEffect instead of onSuccess)
+  // Load device list + details
   const { data: deviceQueryData } = useQuery({
     queryKey: ['device-list'],
     queryFn: async () => {
@@ -92,10 +91,8 @@ export default function DevicePage() {
       const r = { ...next[idx] }
       if (path === 'device_id') r.device_id = val
       else if (path === 'model') r.model = val
-      else if (path === 'site') r.site = val
       else if (path === 'lat') r.location = { ...r.location, lat: val === '' ? null : parseFloat(val) }
       else if (path === 'lng') r.location = { ...r.location, lng: val === '' ? null : parseFloat(val) }
-      else if (path === 'alt') r.location = { ...r.location, alt: val === '' ? null : parseFloat(val) }
       next[idx] = r
       return next
     })
@@ -109,7 +106,9 @@ export default function DevicePage() {
         <p className="text-sm text-gray-500 mt-1">
           Register device GPS coordinates here. The worker identifies devices using the
           <strong className="font-semibold"> Device ID Field</strong> configured per-source in the Visual Mapping page,
-          then injects the matching fixed GPS coordinates into <code className="font-mono text-xs">params.latitude</code> / <code className="font-mono text-xs">params.longitude</code>.
+          then injects the matching fixed GPS coordinates into{' '}
+          <code className="font-mono text-xs">params.latitude</code> /{' '}
+          <code className="font-mono text-xs">params.longitude</code>.
         </p>
       </div>
 
@@ -124,8 +123,8 @@ export default function DevicePage() {
         }
       >
         {/* Table header */}
-        <div className="grid grid-cols-[1.5fr_1.5fr_1fr_1fr_1fr_1fr_auto] gap-2 mb-2 px-1">
-          {['Device ID', 'Model', 'Site', 'Lat', 'Lng', 'Alt (m)', ''].map((h) => (
+        <div className="grid grid-cols-[2fr_2fr_1.2fr_1.2fr_auto] gap-3 mb-2 px-1">
+          {['Device ID *', 'Model', 'Latitude', 'Longitude', ''].map((h) => (
             <span key={h} className="text-xs font-medium text-gray-500">{h}</span>
           ))}
         </div>
@@ -138,7 +137,7 @@ export default function DevicePage() {
           )}
 
           {rows.map((row, i) => (
-            <div key={i} className="grid grid-cols-[1.5fr_1.5fr_1fr_1fr_1fr_1fr_auto] gap-2 items-center">
+            <div key={i} className="grid grid-cols-[2fr_2fr_1.2fr_1.2fr_auto] gap-3 items-center">
               {row._editing ? (
                 <>
                   <Input
@@ -153,27 +152,16 @@ export default function DevicePage() {
                     onChange={(e) => updateRow(i, 'model', e.target.value)}
                   />
                   <Input
-                    placeholder="SZ-HQ"
-                    value={row.site ?? ''}
-                    onChange={(e) => updateRow(i, 'site', e.target.value)}
-                  />
-                  <Input
                     type="number"
-                    placeholder="22.543"
+                    placeholder="22.5431"
                     value={row.location?.lat ?? ''}
                     onChange={(e) => updateRow(i, 'lat', e.target.value)}
                   />
                   <Input
                     type="number"
-                    placeholder="114.057"
+                    placeholder="114.0579"
                     value={row.location?.lng ?? ''}
                     onChange={(e) => updateRow(i, 'lng', e.target.value)}
-                  />
-                  <Input
-                    type="number"
-                    placeholder="120"
-                    value={row.location?.alt ?? ''}
-                    onChange={(e) => updateRow(i, 'alt', e.target.value)}
                   />
                   <div className="flex gap-1">
                     <button
@@ -195,15 +183,11 @@ export default function DevicePage() {
                 <>
                   <span className="text-sm font-mono text-gray-800 truncate">{row.device_id}</span>
                   <span className="text-sm text-gray-600 truncate">{row.model || '—'}</span>
-                  <span className="text-sm text-gray-600">{row.site || '—'}</span>
-                  <span className="text-sm font-mono text-gray-600">
+                  <span className={`text-sm font-mono ${row.location?.lat != null ? 'text-emerald-700' : 'text-gray-300'}`}>
                     {row.location?.lat != null ? row.location.lat.toFixed(5) : '—'}
                   </span>
-                  <span className="text-sm font-mono text-gray-600">
+                  <span className={`text-sm font-mono ${row.location?.lng != null ? 'text-emerald-700' : 'text-gray-300'}`}>
                     {row.location?.lng != null ? row.location.lng.toFixed(5) : '—'}
-                  </span>
-                  <span className="text-sm font-mono text-gray-600">
-                    {row.location?.alt != null ? row.location.alt : '—'}
                   </span>
                   <div className="flex gap-1">
                     <button
@@ -242,11 +226,11 @@ export default function DevicePage() {
             <MapPin className="w-4 h-4 text-teal-600 mt-0.5 shrink-0" />
             <div>
               <p className="font-medium text-gray-700 mb-1">Step 2 — Registry Lookup (this page)</p>
-              <p>The resolved device ID value is matched against the <strong>Device ID</strong> column here.
-                If found, the GPS coordinates are injected into the FH2 body:</p>
+              <p>The resolved device ID value is matched against the <strong>Device ID</strong> column above.
+                If found, coordinates are injected into the FH2 body:</p>
               <pre className="text-xs font-mono bg-gray-900 text-emerald-400 p-2 rounded mt-2">{`params.latitude  = device.location.lat
 params.longitude = device.location.lng`}</pre>
-              <p className="mt-2 text-gray-400 text-xs">The <strong>Device ID</strong> column must exactly match the actual payload value, not a field path.</p>
+              <p className="mt-2 text-gray-400 text-xs">The <strong>Device ID</strong> value must exactly match the actual payload value (not a field path).</p>
             </div>
           </div>
         </div>
