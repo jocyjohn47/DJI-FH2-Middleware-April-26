@@ -2,8 +2,9 @@ import { useEffect, useState, useRef } from 'react'
 import { useQuery, useMutation } from '@tanstack/react-query'
 import { useNavigate } from 'react-router-dom'
 import {
-  sourceService, authService, mappingService, egressService, debugService,
+  sourceService, authService, mappingService, egressService, debugService, eventsService,
 } from '@/services'
+import type { LiveLogEvent } from '@/services'
 import { useSourceStore, useWizardStore } from '@/store'
 import { Card, Badge } from '@/components/ui/Card'
 import { Button } from '@/components/ui/Button'
@@ -33,26 +34,52 @@ function statusBadge(s: StepStatus) {
 function statusIcon(s: StepStatus) {
   if (s === 'ok')   return <CheckCircle className="w-4 h-4 text-emerald-500" />
   if (s === 'warn') return <AlertCircle className="w-4 h-4 text-amber-500" />
-  return                   <XCircle     className="w-4 h-4 text-red-400" />
+  return                   <XCircle className="w-4 h-4 text-red-400" />
+}
+
+function formatLogTime(ts?: number) {
+  if (!ts) return '—'
+  return new Date(ts * 1000).toLocaleString()
+}
+
+function shortText(v?: string, max = 80) {
+  if (!v) return '—'
+  return v.length > max ? `${v.slice(0, max)}…` : v
+}
+
+function logBadge(status?: string) {
+  const s = status || 'unknown'
+  const cls =
+    s === 'success' || s === 'accepted'
+      ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+      : s === 'failed' || s === 'auth_failed' || s === 'mapping_error'
+        ? 'bg-red-50 text-red-700 border-red-200'
+        : 'bg-amber-50 text-amber-700 border-amber-200'
+
+  return (
+    <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-xs font-medium ${cls}`}>
+      {s}
+    </span>
+  )
 }
 
 // ─── Default sample payload used for quick preview ───────────────────────────
 const DEFAULT_SAMPLE: Record<string, unknown> = {
-  timestamp:   '2026-03-18T10:00:00Z',
-  creator_id:  'pilot01',
-  latitude:    22.543096,
-  longitude:   114.057865,
-  level:       'warning',
+  timestamp: '2026-03-18T10:00:00Z',
+  creator_id: 'pilot01',
+  latitude: 22.543096,
+  longitude: 114.057865,
+  level: 'warning',
   description: 'Obstacle detected ahead',
 }
 
 // ─── Inline API Preview Panel ─────────────────────────────────────────────────
 function ApiPreviewPanel({ sourceId }: { sourceId: string }) {
-  const [result, setResult]   = useState<DebugResult | null>(null)
-  const [copied, setCopied]   = useState(false)
+  const [result, setResult] = useState<DebugResult | null>(null)
+  const [copied, setCopied] = useState(false)
   const [payload, setPayload] = useState(JSON.stringify(DEFAULT_SAMPLE, null, 2))
   const [editing, setEditing] = useState(false)
-  const textareaRef           = useRef<HTMLTextAreaElement>(null)
+  const textareaRef = useRef<HTMLTextAreaElement>(null)
 
   const { mutate: runPreview, isPending } = useMutation({
     mutationFn: () => {
@@ -64,8 +91,8 @@ function ApiPreviewPanel({ sourceId }: { sourceId: string }) {
   })
 
   const finalBody: FH2Body | undefined = result?.final_body as FH2Body | undefined
-  const missing: string[]              = result?.missing ?? []
-  const bodyJson: string | null        = finalBody ? JSON.stringify(finalBody, null, 2) : null
+  const missing: string[] = result?.missing ?? []
+  const bodyJson: string | null = finalBody ? JSON.stringify(finalBody, null, 2) : null
 
   const copyBody = () => {
     if (!bodyJson) return
@@ -76,7 +103,6 @@ function ApiPreviewPanel({ sourceId }: { sourceId: string }) {
 
   return (
     <div className="border-t border-gray-100 mt-3 pt-3 space-y-3">
-      {/* Toolbar */}
       <div className="flex items-center gap-2 flex-wrap">
         <span className="text-xs font-semibold text-gray-500 flex items-center gap-1">
           <Eye className="w-3.5 h-3.5" /> 实时 API 输出预览
@@ -108,7 +134,6 @@ function ApiPreviewPanel({ sourceId }: { sourceId: string }) {
         </Button>
       </div>
 
-      {/* Editable payload area */}
       {editing && (
         <textarea
           ref={textareaRef}
@@ -121,10 +146,8 @@ function ApiPreviewPanel({ sourceId }: { sourceId: string }) {
         />
       )}
 
-      {/* Results: 两列并排 */}
       {result && (
         <div className="grid grid-cols-[1fr_auto] gap-3 items-start">
-          {/* FH2 body */}
           <div className="rounded-lg overflow-hidden border border-gray-700">
             <div className="flex items-center justify-between px-3 py-2 bg-gray-900">
               <div className="flex items-center gap-2">
@@ -154,7 +177,6 @@ function ApiPreviewPanel({ sourceId }: { sourceId: string }) {
               )}
             </div>
 
-            {/* Body */}
             <div className="bg-gray-950 min-h-[80px]">
               {result.status === 'error' && (
                 <p className="text-xs text-red-400 font-mono p-3">{result.message}</p>
@@ -170,7 +192,6 @@ function ApiPreviewPanel({ sourceId }: { sourceId: string }) {
               )}
             </div>
 
-            {/* Missing list */}
             {missing.length > 0 && (
               <div className="px-3 py-2 border-t border-gray-800 bg-gray-950 flex flex-wrap gap-1 items-center">
                 <AlertTriangle className="w-3.5 h-3.5 text-amber-400 shrink-0" />
@@ -186,20 +207,18 @@ function ApiPreviewPanel({ sourceId }: { sourceId: string }) {
             )}
           </div>
 
-          {/* Pipeline stage mini-summary */}
           {result.status === 'ok' && (
             <div className="shrink-0 w-44 space-y-1.5">
-              <MiniStage label="① raw"        ok={!!result.raw}        count={Object.keys(result.raw ?? {}).length} />
-              <MiniStage label="② flat"       ok={!!result.flat}       count={Object.keys(result.flat ?? {}).length} />
+              <MiniStage label="① raw" ok={!!result.raw} count={Object.keys(result.raw ?? {}).length} />
+              <MiniStage label="② flat" ok={!!result.flat} count={Object.keys(result.flat ?? {}).length} />
               <MiniStage label="③ normalized" ok={!!result.normalized} count={Object.keys(result.normalized ?? {}).length} />
-              <MiniStage label="④ mapped"     ok={!!result.mapped}     count={Object.keys(result.mapped ?? {}).length} />
+              <MiniStage label="④ mapped" ok={!!result.mapped} count={Object.keys(result.mapped ?? {}).length} />
               <MiniStage label="⑤ final_body" ok={!!result.final_body} count={result.final_body ? Object.keys(result.final_body).length : 0} highlight />
             </div>
           )}
         </div>
       )}
 
-      {/* Idle state */}
       {!result && !isPending && (
         <div className="flex items-center justify-center h-12 text-gray-400 gap-2 border border-dashed border-gray-200 rounded-lg">
           <Play className="w-4 h-4 opacity-40" />
@@ -234,19 +253,19 @@ function PipelineCard({
   const [previewOpen, setPreviewOpen] = useState(false)
 
   const overallStatus: StepStatus =
-    p.steps.every(s => s.status === 'ok')      ? 'ok'      :
-    p.steps.some(s => s.status === 'missing')  ? 'missing' : 'warn'
+    p.steps.every(s => s.status === 'ok')
+      ? 'ok'
+      : p.steps.some(s => s.status === 'missing')
+        ? 'missing'
+        : 'warn'
 
   return (
     <Card>
-      {/* Main row */}
       <div className="flex items-center gap-4">
-        {/* Source ID */}
         <div className="w-32 shrink-0">
           <span className="font-mono text-sm font-semibold text-gray-800">{p.sourceId}</span>
         </div>
 
-        {/* Pipeline steps */}
         <div className="flex-1 flex items-center gap-2">
           {p.steps.map((step, i) => (
             <div key={step.label} className="flex items-center gap-2">
@@ -268,10 +287,8 @@ function PipelineCard({
           ))}
         </div>
 
-        {/* Status badge */}
         <div>{statusBadge(overallStatus)}</div>
 
-        {/* Preview toggle */}
         <button
           type="button"
           onClick={() => setPreviewOpen(!previewOpen)}
@@ -285,17 +302,15 @@ function PipelineCard({
           <Eye className="w-3.5 h-3.5" />
           <span className="hidden sm:inline">API 预览</span>
           {previewOpen
-            ? <ChevronUp   className="w-3 h-3" />
+            ? <ChevronUp className="w-3 h-3" />
             : <ChevronDown className="w-3 h-3" />}
         </button>
 
-        {/* Configure */}
         <Button variant="ghost" size="sm" onClick={onConfigure}>
           Configure <ArrowRight className="w-3.5 h-3.5" />
         </Button>
       </div>
 
-      {/* Expandable preview panel */}
       {previewOpen && <ApiPreviewPanel sourceId={p.sourceId} />}
     </Card>
   )
@@ -317,7 +332,6 @@ export function Dashboard() {
     if (sourceListData) setSources(sourceListData)
   }, [sourceListData, setSources])
 
-  // Per-source pipeline health
   const pipelineQueries = useQuery({
     queryKey: ['pipeline-health', sources],
     enabled: sources.length > 0,
@@ -330,13 +344,13 @@ export function Dashboard() {
             egressService.get(id),
           ])
 
-          const authCfg = auth.status    === 'fulfilled' ? auth.value    : null
-          const mapCfg  = mapping.status === 'fulfilled' ? mapping.value : null
-          const egsCfg  = egress.status  === 'fulfilled' ? egress.value  : null
+          const authCfg = auth.status === 'fulfilled' ? auth.value : null
+          const mapCfg = mapping.status === 'fulfilled' ? mapping.value : null
+          const egsCfg = egress.status === 'fulfilled' ? egress.value : null
 
           const authStatus: StepStatus =
             authCfg?.enabled && authCfg?.token ? 'ok' :
-            authCfg ? 'warn' : 'missing'
+              authCfg ? 'warn' : 'missing'
 
           const mapStatus: StepStatus =
             (mapCfg?.mappings?.length ?? 0) > 0 ? 'ok' : 'missing'
@@ -349,15 +363,21 @@ export function Dashboard() {
           return {
             sourceId: id,
             steps: [
-              { label: 'Source',  status: 'ok'       as StepStatus },
-              { label: 'Auth',    status: authStatus,  detail: authCfg?.header_name },
-              { label: 'Mapping', status: mapStatus,   detail: `${mapCfg?.mappings?.length ?? 0} rules` },
-              { label: 'Egress',  status: egsStatus,   detail: egsCfg?.endpoint?.slice(8, 40) },
+              { label: 'Source', status: 'ok' as StepStatus },
+              { label: 'Auth', status: authStatus, detail: authCfg?.header_name },
+              { label: 'Mapping', status: mapStatus, detail: `${mapCfg?.mappings?.length ?? 0} rules` },
+              { label: 'Egress', status: egsStatus, detail: egsCfg?.endpoint?.slice(8, 40) },
             ],
           }
         }),
       )
     },
+  })
+
+  const { data: recentLogs = [], isFetching: logsRefreshing } = useQuery({
+    queryKey: ['recent-logs'],
+    queryFn: () => eventsService.recent('', 100),
+    refetchInterval: 3000,
   })
 
   const pipelines: SourcePipeline[] = (pipelineQueries.data as SourcePipeline[] | undefined) ?? []
@@ -431,6 +451,93 @@ export function Dashboard() {
             />
           ))}
         </div>
+      </div>
+
+      {/* Recent logs */}
+      <div>
+        <div className="flex items-center justify-between mb-3">
+          <h2 className="text-base font-semibold text-gray-800">Recent Logs</h2>
+          <span className="text-xs text-gray-400">
+            {logsRefreshing ? 'Refreshing…' : 'Auto refresh: 3s'}
+          </span>
+        </div>
+
+        <Card>
+          <div className="overflow-x-auto">
+            <table className="min-w-full text-sm">
+              <thead>
+                <tr className="border-b border-gray-200 text-left text-xs text-gray-500 uppercase">
+                  <th className="px-3 py-2">Time</th>
+                  <th className="px-3 py-2">Source</th>
+                  <th className="px-3 py-2">Direction</th>
+                  <th className="px-3 py-2">Stage</th>
+                  <th className="px-3 py-2">Status</th>
+                  <th className="px-3 py-2">HTTP</th>
+                  <th className="px-3 py-2">Alert</th>
+                  <th className="px-3 py-2">Camera</th>
+                  <th className="px-3 py-2">Coordinates</th>
+                  <th className="px-3 py-2">Message / Error</th>
+                </tr>
+              </thead>
+
+              <tbody>
+                {(recentLogs as LiveLogEvent[]).length === 0 && (
+                  <tr>
+                    <td colSpan={10} className="px-3 py-8 text-center text-gray-400">
+                      No logs yet
+                    </td>
+                  </tr>
+                )}
+
+                {(recentLogs as LiveLogEvent[]).map((log, idx) => (
+                  <tr key={`${log.ts}-${log.msg_id ?? idx}`} className="border-b border-gray-100 align-top">
+                    <td className="px-3 py-2 whitespace-nowrap text-xs text-gray-600">
+                      {formatLogTime(log.ts)}
+                    </td>
+
+                    <td className="px-3 py-2 font-mono text-xs text-gray-700">
+                      {log.source || '—'}
+                    </td>
+
+                    <td className="px-3 py-2 text-xs">
+                      {log.direction || '—'}
+                    </td>
+
+                    <td className="px-3 py-2 text-xs">
+                      {log.stage || '—'}
+                    </td>
+
+                    <td className="px-3 py-2">
+                      {logBadge(log.status)}
+                    </td>
+
+                    <td className="px-3 py-2 text-xs">
+                      {log.http_status ?? '—'}
+                    </td>
+
+                    <td className="px-3 py-2 text-xs max-w-[140px] truncate">
+                      {log.preview?.alert || '—'}
+                    </td>
+
+                    <td className="px-3 py-2 text-xs max-w-[120px] truncate">
+                      {log.preview?.camera || '—'}
+                    </td>
+
+                    <td className="px-3 py-2 text-xs font-mono whitespace-nowrap">
+                      {log.preview?.latitude || log.preview?.longitude
+                        ? `${log.preview?.latitude ?? '—'}, ${log.preview?.longitude ?? '—'}`
+                        : '—'}
+                    </td>
+
+                    <td className="px-3 py-2 text-xs text-gray-600 max-w-[320px]">
+                      {shortText(log.error || log.response || '')}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </Card>
       </div>
     </div>
   )
