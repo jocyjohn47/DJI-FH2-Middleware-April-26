@@ -133,6 +133,38 @@ export const deviceIdFieldService = {
   },
 }
 
+// ─── Recent live logs ─────────────────────────────────────────────────────────
+
+export interface LiveLogEvent {
+  ts: number
+  source: string
+  direction: 'receive' | 'send' | string
+  stage: string
+  status: string
+  http_status?: number
+  msg_id?: string
+  preview?: {
+    alert?: string
+    camera?: string
+    latitude?: string | number
+    longitude?: string | number
+  }
+  request_headers?: Record<string, string>
+  missing_fields?: string[]
+  response?: string
+  error?: string
+}
+
+export const eventsService = {
+  async recent(sourceId = '', limit = 100): Promise<LiveLogEvent[]> {
+    const { data } = await apiClient.post('/admin/events/recent', {
+      source: sourceId,
+      limit,
+    })
+    return (data.events ?? []) as LiveLogEvent[]
+  },
+}
+
 // ─── Integration test ─────────────────────────────────────────────────────────
 
 export interface TestPayload {
