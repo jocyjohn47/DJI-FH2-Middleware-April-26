@@ -2,6 +2,7 @@ import json
 from typing import Any
 from redis.asyncio import Redis
 
+
 class RedisRepo:
     def __init__(self, redis: Redis):
         self.redis = redis
@@ -121,4 +122,13 @@ class RedisRepo:
 
         for row in rows:
             try:
-                item<span class="cursor">█</span>
+                item = json.loads(row)
+            except Exception:
+                continue
+
+            if source and item.get("source") != source:
+                continue
+
+            out.append(item)
+
+        return out
