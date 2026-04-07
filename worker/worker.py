@@ -10,7 +10,6 @@ from redis.asyncio import Redis
 from app.config import settings
 from app.redis_repo import RedisRepo
 from app.mapping_engine import apply_mappings
-# ── Pipeline stages ──────────────────────────────────────────────────────────
 from app.flatten import flatten_json
 from app.normalize import normalize
 from app.enrichment import enrich
@@ -19,6 +18,26 @@ from app.autofill import autofill, build_fh2_body
 
 def _now_ts() -> int:
     return int(time.time())
+
+
+def _preview_from_raw(obj: dict) -> dict:
+    coordinates = obj.get("coordinates") if isinstance(obj.get("coordinates"), dict) else {}
+    return {
+        "alert": obj.get("alertLabel") or obj.get("description") or obj.get("desc") or "",
+        "camera": obj.get("camera") or obj.get("creator_id") or obj.get("creator") or "",
+        "latitude": obj.get("latitude") or coordinates.get("lat") or "",
+        "longitude": obj.get("longitude") or coordinates.get("lng") or "",
+    }
+
+
+def _preview_from_body(body: dict) -> dict:
+    params = body.get("params") if isinstance(body.get("params"), dict) else {}
+    return {
+        "alert": params.get("desc") or "",
+        "camera": params.get("creator") or "",
+        "latitude": params.get("latitude") or "",
+        "longitude": params.get("longitude") or "",
+    }
 
 
 async def push_flighthub(endpoint: str, headers: dict, body: dict, retry_policy: dict | None):
@@ -39,9 +58,13 @@ async def push_flighthub(endpoint: str, headers: dict, body: dict, retry_policy:
 
 async def ensure_group(redis: Redis):
     try:
-        await redis.xgroup_create(name=settings.STREAM_KEY_RAW, groupname=settings.STREAM_GROUP, id="0-0", mkstream=True)
+        await redis.xgroup_create(
+            name=settings.STREAM_KEY_RAW,
+            groupname=settings.STREAM_GROUP,
+            id="0-0",
+            mkstream=True,
+        )
     except Exception as e:
-        # BUSYGROUP means already exists
         if "BUSYGROUP" not in str(e):
             raise
 
@@ -52,10 +75,12 @@ async def run():
 
     await ensure_group(redis)
 
-    print(f"[worker] consuming redis stream={settings.STREAM_KEY_RAW} group={settings.STREAM_GROUP} consumer={settings.STREAM_CONSUMER}")
+    print(
+        f"[worker] consuming redis stream={settings.STREAM_KEY_RAW} "
+        f"group={settings.STREAM_GROUP} consumer={settings.STREAM_CONSUMER}"
+    )
 
     while True:
-        # Read one message at a time, block up to 5s
         resp = await redis.xreadgroup(
             groupname=settings.STREAM_GROUP,
             consumername=settings.STREAM_CONSUMER,
@@ -84,40 +109,44 @@ async def run():
 
                 endpoint = (fhcfg.get("endpoint") if isinstance(fhcfg, dict) else None) or settings.DEFAULT_FLIGHTHUB_ENDPOINT
                 headers = (fhcfg.get("headers") if isinstance(fhcfg, dict) else None) or {}
-                retry_policy = (fhcfg.get("retry_policy") if isinstance(fhcfg, dict) else None) or {"max_retries": 3, "backoff": "exponential"}
+                retry_policy = (fhcfg.get("retry_policy") if isinstance(fhcfg, dict) else None) or {
+                    "max_retries": 3,
+                    "backoff": "exponential",
+                }
 
                 headers = dict(headers)
                 headers.setdefault("Content-Type", "application/json")
 
-                # ── Pipeline: raw → flatten → normalize → mapping → autofill → HTTP ──
-                #
-                # Step 1: Flatten nested event into dot-notation dict
                 flat = flatten_json(webhook_event)
-
-                # Step 2: Normalize — apply adapter config to produce unified fields
                 adapter_conf = await repo.get_adapter(source)
                 normalized_flat = normalize(flat, adapter_conf)
 
-                # Step 3: Mapping — JSONPath / DSL mappings applied to normalized flat
                 try:
                     unified = apply_mappings(
-                        webhook_event, source, mapping_conf, received_at,
+                        webhook_event,
+                        source,
+                        mapping_conf,
+                        received_at,
                         flat_event=normalized_flat,
                     )
                 except Exception as e:
                     print(f"[worker] mapping error source={source}: {e}")
+                    await repo.log_recent_event({
+                        "ts": _now_ts(),
+                        "source": source,
+                        "direction": "send",
+                        "stage": "mapping",
+                        "status": "mapping_error",
+                        "http_status": 0,
+                        "msg_id": msg_id,
+                        "preview": _preview_from_raw(webhook_event),
+                        "error": str(e),
+                    })
                     await redis.xack(settings.STREAM_KEY_RAW, settings.STREAM_GROUP, msg_id)
                     continue
 
-                # Step 4: Enrichment — inject device metadata if available
                 unified = await enrich(unified, repo)
 
-                # Step 5: Autofill → build final FH2 request body
-                #
-                # Resolve device_id:
-                #  a) Standard key: unified["device_id"] or unified["device"]["id"]
-                #  b) Per-source configured field (device_id_field) for vendors that
-                #     use a non-standard identifier field (e.g. deviceSN, camera.id)
                 device_id = unified.get("device_id") or ""
                 if isinstance(unified.get("device"), dict):
                     device_id = device_id or unified["device"].get("id", "")
@@ -125,10 +154,7 @@ async def run():
                 if not device_id:
                     device_id_field = await repo.get_device_id_field(source)
                     if device_id_field:
-                        # Try unified dict first, then the flat dict
-                        device_id = str(
-                            unified.get(device_id_field) or flat.get(device_id_field) or ""
-                        )
+                        device_id = str(unified.get(device_id_field) or flat.get(device_id_field) or "")
 
                 device_info = (await repo.get_device(str(device_id))) if device_id else {}
 
@@ -147,9 +173,26 @@ async def run():
                     print(f"[worker] missing fields source={source} fields={missing_fields}")
 
                 status, text = await push_flighthub(endpoint, headers, body, retry_policy)
-                print(f"[worker] pushed msg_id={msg_id} source={source} http_status={status} name={body.get('name') if isinstance(body, dict) else 'n/a'}")
+
+                print(
+                    f"[worker] pushed msg_id={msg_id} source={source} "
+                    f"http_status={status} name={body.get('name') if isinstance(body, dict) else 'n/a'}"
+                )
                 if status and status >= 400:
                     print(f"[worker] response: {text[:300]}")
+
+                await repo.log_recent_event({
+                    "ts": _now_ts(),
+                    "source": source,
+                    "direction": "send",
+                    "stage": "egress",
+                    "status": "success" if status and status < 400 else "failed",
+                    "http_status": status,
+                    "msg_id": msg_id,
+                    "preview": _preview_from_body(body),
+                    "missing_fields": missing_fields,
+                    "response": text[:500] if text else "",
+                })
 
                 await redis.xack(settings.STREAM_KEY_RAW, settings.STREAM_GROUP, msg_id)
 
