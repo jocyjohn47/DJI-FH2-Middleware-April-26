@@ -3,7 +3,7 @@ from __future__ import annotations
 import time
 from typing import Any
 
-from fastapi import FastAPI, Request, Header
+from fastapi import FastAPI, Request, Header, Query
 from fastapi import HTTPException
 from fastapi.responses import HTMLResponse
 from starlette.staticfiles import StaticFiles
@@ -29,7 +29,11 @@ from fastapi.responses import FileResponse as _FileResponse
 _CONSOLE_DIR = _os.path.join(_os.path.dirname(__file__), "static", "console")
 
 if _os.path.isdir(_CONSOLE_DIR):
-    app.mount("/console/assets", StaticFiles(directory=_os.path.join(_CONSOLE_DIR, "assets")), name="console-assets")
+    app.mount(
+        "/console/assets",
+        StaticFiles(directory=_os.path.join(_CONSOLE_DIR, "assets")),
+        name="console-assets",
+    )
 
     @app.get("/console/{full_path:path}", include_in_schema=False)
     async def serve_console(full_path: str):  # noqa: ARG001
@@ -40,6 +44,7 @@ if _os.path.isdir(_CONSOLE_DIR):
     async def serve_console_root():
         index = _os.path.join(_CONSOLE_DIR, "index.html")
         return _FileResponse(index)
+
 
 @app.get("/favicon.ico", include_in_schema=False)
 async def favicon():
@@ -77,6 +82,7 @@ def _extract_tokens(raw: str) -> dict:
                 out[k] = m.group(1).strip().strip('"')
                 break
     return out
+
 
 redis: Redis | None = None
 repo: RedisRepo | None = None
@@ -128,38 +134,64 @@ def _require_source_auth(source: str, request: Request, srcauth: dict):
 
 
 @app.post("/webhook")
-async def webhook_ingest(payload: dict[str, Any], request: Request):
-    """POST only. Body: {source, webhook_event}. Requires per-source inbound auth."""
+async def webhook_ingest(
+    payload: dict[str, Any],
+    request: Request,
+    source: str | None = Query(default=None),
+):
+    """POST only.
+
+    Supports BOTH:
+    1) Wrapped body:
+       { "source": "scylla", "webhook_event": {...} }
+
+    2) Raw vendor body:
+       /webhook?source=scylla
+       { ...raw vendor JSON... }
+
+    Requires per-source inbound auth.
+    """
     global bus, repo
     assert bus is not None
     assert repo is not None
 
-    source = payload.get("source") or settings.DEFAULT_SOURCE
+    src = source or payload.get("source") or settings.DEFAULT_SOURCE
+
     webhook_event = payload.get("webhook_event")
     if webhook_event is None:
-        return {"status": "error", "message": "missing webhook_event"}
+        # Accept raw vendor payload directly
+        webhook_event = payload
 
     # inbound auth gate (pass -> enqueue)
-    srcauth = await repo.get_source_auth(source)
-    _require_source_auth(source, request, srcauth)
+    srcauth = await repo.get_source_auth(src)
+    _require_source_auth(src, request, srcauth)
 
     received_at = int(time.time())
 
     # store some request meta for debugging/audit
     hdr = {}
-    for k in ("content-type", "user-agent", "x-forwarded-for"):
+    for k in ("content-type", "user-agent", "x-forwarded-for", "authorization"):
         if k in request.headers:
             hdr[k] = request.headers.get(k)
 
     msg = {
-        "source": source,
+        "source": src,
         "received_at": received_at,
-        "request": {"path": str(request.url.path), "method": "POST", "headers": hdr},
+        "request": {
+            "path": str(request.url.path),
+            "method": "POST",
+            "headers": hdr,
+        },
         "webhook_event": webhook_event,
     }
 
     await bus.produce(msg)
-    return {"status": "accepted", "queue": "redis_stream", "stream": settings.STREAM_KEY_RAW}
+    return {
+        "status": "accepted",
+        "queue": "redis_stream",
+        "stream": settings.STREAM_KEY_RAW,
+        "source": src,
+    }
 
 
 def _default_mapping() -> dict:
@@ -530,6 +562,7 @@ async def device_id_field_set(payload: dict[str, Any], x_admin_token: str | None
         return {"status": "error", "message": "missing source"}
     await repo.set_device_id_field(source, str(field))
     return {"status": "ok", "source": source}
+
 
 # ════════════════════════════════════════════════════════════════════════════
 # DEBUG  — run full pipeline on a sample payload, return each stage output
