@@ -133,6 +133,22 @@ def _require_source_auth(source: str, request: Request, srcauth: dict):
         raise HTTPException(status_code=401, detail="auth_failed")
 
 
+def _event_preview(obj: Any) -> dict[str, Any]:
+    if not isinstance(obj, dict):
+        return {"summary": str(obj)[:200]}
+
+    coordinates = obj.get("coordinates")
+    if not isinstance(coordinates, dict):
+        coordinates = {}
+
+    return {
+        "alert": obj.get("alertLabel") or obj.get("description") or obj.get("desc") or "",
+        "camera": obj.get("camera") or obj.get("creator_id") or obj.get("creator") or "",
+        "latitude": obj.get("latitude") or coordinates.get("lat") or "",
+        "longitude": obj.get("longitude") or coordinates.get("lng") or "",
+    }
+
+
 @app.post("/webhook")
 async def webhook_ingest(
     payload: dict[str, Any],
@@ -162,17 +178,32 @@ async def webhook_ingest(
         # Accept raw vendor payload directly
         webhook_event = payload
 
-    # inbound auth gate (pass -> enqueue)
-    srcauth = await repo.get_source_auth(src)
-    _require_source_auth(src, request, srcauth)
-
     received_at = int(time.time())
+    preview = _event_preview(webhook_event)
 
     # store some request meta for debugging/audit
     hdr = {}
     for k in ("content-type", "user-agent", "x-forwarded-for", "authorization"):
         if k in request.headers:
             hdr[k] = request.headers.get(k)
+
+    try:
+        # inbound auth gate (pass -> enqueue)
+        srcauth = await repo.get_source_auth(src)
+        _require_source_auth(src, request, srcauth)
+    except HTTPException as exc:
+        await repo.log_recent_event({
+            "ts": received_at,
+            "source": src,
+            "direction": "receive",
+            "stage": "ingress",
+            "status": "auth_failed" if exc.status_code in (401, 403) else "rejected",
+            "http_status": exc.status_code,
+            "preview": preview,
+            "request_headers": hdr,
+            "error": str(exc.detail),
+        })
+        raise
 
     msg = {
         "source": src,
@@ -186,6 +217,18 @@ async def webhook_ingest(
     }
 
     await bus.produce(msg)
+
+    await repo.log_recent_event({
+        "ts": received_at,
+        "source": src,
+        "direction": "receive",
+        "stage": "ingress",
+        "status": "accepted",
+        "http_status": 200,
+        "preview": preview,
+        "request_headers": hdr,
+    })
+
     return {
         "status": "accepted",
         "queue": "redis_stream",
@@ -239,6 +282,24 @@ async def source_list(payload: dict[str, Any], x_admin_token: str | None = Heade
 
     sources = await repo.list_sources()
     return {"status": "ok", "sources": sources}
+
+
+@app.post("/admin/events/recent")
+async def events_recent(payload: dict[str, Any], x_admin_token: str | None = Header(default=None)):
+    global repo
+    assert repo is not None
+    _require_admin(x_admin_token)
+
+    try:
+        limit = int(payload.get("limit", 100))
+    except Exception:
+        limit = 100
+
+    limit = max(1, min(limit, 100))
+    source = str(payload.get("source") or "").strip()
+
+    events = await repo.list_recent_events(limit=limit, source=source)
+    return {"status": "ok", "events": events}
 
 
 @app.post("/admin/source/init")
@@ -533,7 +594,7 @@ async def device_list(payload: dict[str, Any], x_admin_token: str | None = Heade
     return {"status": "ok", "devices": sorted(device_ids)}
 
 
-# ── Device ID Field (per-source) ────────────────────────────────────────────────────────
+# ── Device ID Field (per-source) ─────────────────────────────────────────────
 
 @app.post("/admin/deviceidfield/get")
 async def device_id_field_get(payload: dict[str, Any], x_admin_token: str | None = Header(default=None)):
@@ -592,7 +653,6 @@ async def debug_run(payload: dict[str, Any], x_admin_token: str | None = Header(
 
     source = payload.get("source") or settings.DEFAULT_SOURCE
     raw: dict = payload.get("sample_payload") or {}
-    # mapping_override: if provided by frontend (unsaved visual mapping), use it directly
     mapping_override: dict | None = payload.get("mapping_override") or None
 
     stages: dict[str, Any] = {"source": source, "raw": raw}
@@ -609,8 +669,6 @@ async def debug_run(payload: dict[str, Any], x_admin_token: str | None = Header(
         stages["normalized_fields"] = get_normalized_fields(flat, adapter_conf)
 
         # Stage 3 — mapping
-        # Use override when provided (unsaved visual mapping from frontend),
-        # otherwise fall back to the saved Redis config.
         mapping_conf = mapping_override if mapping_override else await repo.get_mapping(source)
         received_at = int(_time.time())
         mapped = apply_mappings(raw, source, mapping_conf, received_at, flat_event=normalized)
