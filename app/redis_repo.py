@@ -1,4 +1,5 @@
 import json
+from typing import Any
 from redis.asyncio import Redis
 
 class RedisRepo:
@@ -9,7 +10,6 @@ class RedisRepo:
         """List sources that have mapping and/or flighthub config."""
         sources: set[str] = set()
 
-        # Prefer SCAN over KEYS (still fine for POC size)
         cursor = 0
         for prefix in ("uw:map:", "uw:fhcfg:"):
             cursor = 0
@@ -37,24 +37,21 @@ class RedisRepo:
     def _k_srcauth(source: str) -> str:
         return f"uw:srcauth:{source}"
 
-    # ── NEW keys (STEP 6) ─────────────────────────────────────────────────────
-
     @staticmethod
     def _k_adapter(source: str) -> str:
-        """uw:adapter:{source}  →  adapter field-normalization config."""
         return f"uw:adapter:{source}"
 
     @staticmethod
     def _k_device(device_id: str) -> str:
-        """uw:device:{device_id}  →  device metadata for enrichment."""
         return f"uw:device:{device_id}"
 
     @staticmethod
     def _k_device_id_field(source: str) -> str:
-        """uw:deviceidfield:{source}  →  which payload field holds the device ID."""
         return f"uw:deviceidfield:{source}"
 
-    # ── Existing methods (unchanged) ──────────────────────────────────────────
+    @staticmethod
+    def _k_recent_events() -> str:
+        return "uw:events:recent"
 
     async def get_mapping(self, source: str) -> dict:
         raw = await self.redis.get(self._k_map(source))
@@ -83,34 +80,25 @@ class RedisRepo:
     async def set_source_auth(self, source: str, cfg: dict) -> None:
         await self.redis.set(self._k_srcauth(source), json.dumps(cfg, ensure_ascii=False))
 
-    # ── NEW methods (STEP 6) ──────────────────────────────────────────────────
-
     async def get_adapter(self, source: str) -> dict:
-        """Return adapter config for *source*.  Empty dict if not configured."""
         raw = await self.redis.get(self._k_adapter(source))
         if not raw:
             return {}
         return json.loads(raw)
 
     async def set_adapter(self, source: str, cfg: dict) -> None:
-        """Persist adapter config for *source*."""
         await self.redis.set(self._k_adapter(source), json.dumps(cfg, ensure_ascii=False))
 
     async def get_device(self, device_id: str) -> dict:
-        """Return device metadata.  Empty dict if not found."""
         raw = await self.redis.get(self._k_device(device_id))
         if not raw:
             return {}
         return json.loads(raw)
 
     async def set_device(self, device_id: str, info: dict) -> None:
-        """Persist device metadata."""
         await self.redis.set(self._k_device(device_id), json.dumps(info, ensure_ascii=False))
 
     async def get_device_id_field(self, source: str) -> str:
-        """Return the payload field name used as device lookup key for *source*.
-        Empty string means use the default 'device_id' key.
-        """
         raw = await self.redis.get(self._k_device_id_field(source))
         if not raw:
             return ""
@@ -118,6 +106,19 @@ class RedisRepo:
         return str(val) if val else ""
 
     async def set_device_id_field(self, source: str, field: str) -> None:
-        """Persist device ID field config for *source*."""
         await self.redis.set(self._k_device_id_field(source), json.dumps(field, ensure_ascii=False))
 
+    async def log_recent_event(self, event: dict[str, Any], max_items: int = 100) -> None:
+        key = self._k_recent_events()
+        raw = json.dumps(event, ensure_ascii=False)
+        await self.redis.lpush(key, raw)
+        await self.redis.ltrim(key, 0, max_items - 1)
+
+    async def list_recent_events(self, limit: int = 100, source: str = "") -> list[dict[str, Any]]:
+        key = self._k_recent_events()
+        rows = await self.redis.lrange(key, 0, max(0, limit - 1))
+        out: list[dict[str, Any]] = []
+
+        for row in rows:
+            try:
+                item<span class="cursor">█</span>
