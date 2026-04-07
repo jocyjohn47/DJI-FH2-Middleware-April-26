@@ -1,0 +1,31 @@
+services:
+  - name: dji-fh2-redis
+    type: keyvalue
+    plan: starter
+    ipAllowList: []
+
+  - name: dji-fh2-middleware
+    type: web
+    runtime: docker
+    plan: starter
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /docs
+    autoDeployTrigger: commit
+    envVars:
+      - key: REDIS_URL
+        fromService:
+          name: dji-fh2-redis
+          type: keyvalue
+          property: connectionString
+
+      - key: ADMIN_TOKEN
+        generateValue: true
+
+      - key: DEFAULT_SOURCE
+        value: flighthub2
+
+      - key: STREAM_KEY_RAW
+        value: uw:webhook:raw
+
+      - key: STREAM_GROUP
+        value: uw-worker-group
