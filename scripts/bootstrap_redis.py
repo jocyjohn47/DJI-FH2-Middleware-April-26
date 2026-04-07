@@ -11,7 +11,7 @@ from redis.asyncio import Redis
 from app.config import settings
 from app.redis_repo import RedisRepo
 
-DEFAULT_SOURCE = "flighthub2"
+DEFAULT_SOURCE = settings.DEFAULT_SOURCE or "flighthub2"
 
 DEFAULT_MAPPING = {
   "mappings": [
@@ -25,14 +25,14 @@ DEFAULT_MAPPING = {
 }
 
 DEFAULT_FHCFG = {
-  "endpoint": "https://es-flight-api-us.djigate.com/openapi/v0.1/workflow",
+  "endpoint": settings.DEFAULT_FLIGHTHUB_ENDPOINT,
   "headers": {
     "Content-Type": "application/json",
-    "X-User-Token": "YOUR_SECRET_TOKEN",
-    "x-project-uuid": "YOUR_PROJECT_UUID"
+    "X-User-Token": "",
+    "x-project-uuid": ""
   },
   "template_body": {
-    "workflow_uuid": "YOUR_WORKFLOW_UUID",
+    "workflow_uuid": "",
     "trigger_type": 0,
     "name": "Alert-{{timestamp}}",
     "params": {
@@ -46,13 +46,27 @@ DEFAULT_FHCFG = {
   "retry_policy": {"max_retries": 3, "backoff": "exponential"}
 }
 
+
 async def main():
     r = Redis.from_url(settings.REDIS_URL, decode_responses=False)
     repo = RedisRepo(r)
-    await repo.set_mapping(DEFAULT_SOURCE, DEFAULT_MAPPING)
-    await repo.set_fhcfg(DEFAULT_SOURCE, DEFAULT_FHCFG)
+
+    existing_mapping = await repo.get_mapping(DEFAULT_SOURCE)
+    if not existing_mapping or not existing_mapping.get("mappings"):
+        await repo.set_mapping(DEFAULT_SOURCE, DEFAULT_MAPPING)
+        print(f"bootstrapped mapping for source={DEFAULT_SOURCE}")
+    else:
+        print(f"mapping already exists for source={DEFAULT_SOURCE}; keeping existing value")
+
+    existing_fhcfg = await repo.get_fhcfg(DEFAULT_SOURCE)
+    if not existing_fhcfg:
+        await repo.set_fhcfg(DEFAULT_SOURCE, DEFAULT_FHCFG)
+        print(f"bootstrapped flighthub config for source={DEFAULT_SOURCE}")
+    else:
+        print(f"flighthub config already exists for source={DEFAULT_SOURCE}; keeping existing value")
+
     await r.aclose()
-    print("bootstrapped redis keys for source=flighthub2")
+
 
 if __name__ == "__main__":
     asyncio.run(main())
