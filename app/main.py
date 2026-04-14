@@ -56,16 +56,16 @@ async def favicon():
 _TOKEN_PATTERNS = {
     "X-User-Token": [
         re.compile(r"(?im)^\s*X-User-Token\s*:\s*([^\r\n]+)\s*$"),
-        re.compile(r"(?i)\"X-User-Token\"\s*:\s*\"([^\"]+)\""),
+        re.compile(r'(?i)"X-User-Token"\s*:\s*"([^"]+)"'),
         re.compile(r"(?i)\bX-User-Token\b\s*=\s*([^\s;]+)"),
     ],
     "x-project-uuid": [
         re.compile(r"(?im)^\s*x-project-uuid\s*:\s*([^\r\n]+)\s*$"),
-        re.compile(r"(?i)\"x-project-uuid\"\s*:\s*\"([^\"]+)\""),
+        re.compile(r'(?i)"x-project-uuid"\s*:\s*"([^"]+)"'),
         re.compile(r"(?i)\bx-project-uuid\b\s*=\s*([^\s;]+)"),
     ],
     "workflow_uuid": [
-        re.compile(r"(?i)\"workflow_uuid\"\s*:\s*\"([^\"]+)\""),
+        re.compile(r'(?i)"workflow_uuid"\s*:\s*"([^"]+)"'),
         re.compile(r"(?i)\bworkflow_uuid\b\s*=\s*([^\s;]+)"),
     ],
 }
@@ -110,22 +110,38 @@ async def on_shutdown():
 
 
 def _require_source_auth(source: str, request: Request, srcauth: dict):
-    """Inbound auth: only authenticated requests can enter queue.
-
-    Current POC supports: mode=static_token.
+    """
+    Inbound auth rules:
+    - enabled=false  -> source is disabled completely
+    - mode=none/off/disabled -> allow request without auth header
+    - mode=static_token -> require exact header/token match
     """
     if not isinstance(srcauth, dict) or not srcauth:
-        raise HTTPException(status_code=401, detail=f"source_not_registered_or_auth_missing: {source}")
+        raise HTTPException(
+            status_code=401,
+            detail=f"source_not_registered_or_auth_missing: {source}",
+        )
 
     enabled = bool(srcauth.get("enabled", True))
     if not enabled:
-        raise HTTPException(status_code=403, detail=f"source_disabled: {source}")
+        raise HTTPException(
+            status_code=403,
+            detail=f"source_disabled: {source}",
+        )
 
-    mode = (srcauth.get("mode") or "static_token").lower()
+    mode = str(srcauth.get("mode") or "static_token").lower().strip()
+
+    # Allow temporary no-auth mode for vendor/VMS testing
+    if mode in ("none", "disabled", "off"):
+        return
+
     if mode != "static_token":
-        raise HTTPException(status_code=400, detail=f"unsupported_auth_mode: {mode}")
+        raise HTTPException(
+            status_code=400,
+            detail=f"unsupported_auth_mode: {mode}",
+        )
 
-    header_name = srcauth.get("header_name") or "X-MW-Token"
+    header_name = str(srcauth.get("header_name") or "X-MW-Token").strip()
     expected = str(srcauth.get("token") or "")
     got = request.headers.get(header_name) or ""
 
@@ -149,46 +165,82 @@ def _event_preview(obj: Any) -> dict[str, Any]:
     }
 
 
-@app.post("/webhook")
-async def webhook_ingest(
+def _resolve_source(
+    request: Request,
+    payload: dict[str, Any],
+    source_query: str | None = None,
+    source_path: str | None = None,
+) -> str:
+    return (
+        source_path
+        or source_query
+        or payload.get("source")
+        or request.headers.get("x-source")
+        or request.headers.get("x-vms-source")
+        or settings.DEFAULT_SOURCE
+    )
+
+
+def _extract_webhook_event(payload: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {}
+
+    if isinstance(payload.get("webhook_event"), dict):
+        return payload["webhook_event"]
+
+    if isinstance(payload.get("event"), dict):
+        return payload["event"]
+
+    if isinstance(payload.get("payload"), dict):
+        return payload["payload"]
+
+    if isinstance(payload.get("raw"), dict):
+        return payload["raw"]
+
+    return payload
+
+
+def _auth_failed_status(exc: HTTPException) -> str:
+    if exc.status_code in (401, 403):
+        return "auth_failed"
+    return "rejected"
+
+
+async def _handle_webhook_ingest(
     payload: dict[str, Any],
     request: Request,
-    source: str | None = Query(default=None),
+    source_query: str | None = None,
+    source_path: str | None = None,
 ):
-    """POST only.
-
-    Supports BOTH:
-    1) Wrapped body:
-       { "source": "scylla", "webhook_event": {...} }
-
-    2) Raw vendor body:
-       /webhook?source=scylla
-       { ...raw vendor JSON... }
-
-    Requires per-source inbound auth.
-    """
     global bus, repo
     assert bus is not None
     assert repo is not None
 
-    src = source or payload.get("source") or settings.DEFAULT_SOURCE
+    src = _resolve_source(
+        request=request,
+        payload=payload,
+        source_query=source_query,
+        source_path=source_path,
+    )
 
-    webhook_event = payload.get("webhook_event")
-    if webhook_event is None:
-        # Accept raw vendor payload directly
-        webhook_event = payload
+    webhook_event = _extract_webhook_event(payload)
 
     received_at = int(time.time())
     preview = _event_preview(webhook_event)
 
-    # store some request meta for debugging/audit
     hdr = {}
-    for k in ("content-type", "user-agent", "x-forwarded-for", "authorization"):
+    for k in (
+        "content-type",
+        "user-agent",
+        "x-forwarded-for",
+        "authorization",
+        "x-source",
+        "x-vms-source",
+    ):
         if k in request.headers:
             hdr[k] = request.headers.get(k)
 
     try:
-        # inbound auth gate (pass -> enqueue)
         srcauth = await repo.get_source_auth(src)
         _require_source_auth(src, request, srcauth)
     except HTTPException as exc:
@@ -197,7 +249,7 @@ async def webhook_ingest(
             "source": src,
             "direction": "receive",
             "stage": "ingress",
-            "status": "auth_failed" if exc.status_code in (401, 403) else "rejected",
+            "status": _auth_failed_status(exc),
             "http_status": exc.status_code,
             "preview": preview,
             "request_headers": hdr,
@@ -235,6 +287,60 @@ async def webhook_ingest(
         "stream": settings.STREAM_KEY_RAW,
         "source": src,
     }
+
+
+@app.post("/webhook")
+async def webhook_ingest(
+    payload: dict[str, Any],
+    request: Request,
+    source: str | None = Query(default=None),
+):
+    """
+    Generic webhook endpoint.
+
+    Supports:
+    1) Query style:
+       POST /webhook?source=scylla
+
+    2) Body style:
+       {
+         "source": "scylla",
+         "webhook_event": {...}
+       }
+
+    3) Raw vendor body:
+       POST /webhook?source=scylla
+       { ...vendor JSON... }
+
+    4) Source header style:
+       X-Source: scylla
+       or
+       X-VMS-Source: scylla
+    """
+    return await _handle_webhook_ingest(
+        payload=payload,
+        request=request,
+        source_query=source,
+    )
+
+
+@app.post("/webhook/{source_name}")
+async def webhook_ingest_by_path(
+    source_name: str,
+    payload: dict[str, Any],
+    request: Request,
+):
+    """
+    Path-based webhook endpoint for vendor/VMS compatibility.
+
+    Example:
+      POST /webhook/scylla
+    """
+    return await _handle_webhook_ingest(
+        payload=payload,
+        request=request,
+        source_path=source_name,
+    )
 
 
 def _default_mapping() -> dict:
@@ -652,7 +758,15 @@ async def debug_run(payload: dict[str, Any], x_admin_token: str | None = Header(
     from app.autofill import autofill, build_fh2_body
 
     source = payload.get("source") or settings.DEFAULT_SOURCE
-    raw: dict = payload.get("sample_payload") or {}
+    raw: dict = (
+        payload.get("sample_payload")
+        or payload.get("sample")
+        or payload.get("webhook_event")
+        or payload.get("event")
+        or payload.get("payload")
+        or payload.get("raw")
+        or {}
+    )
     mapping_override: dict | None = payload.get("mapping_override") or None
 
     stages: dict[str, Any] = {"source": source, "raw": raw}
