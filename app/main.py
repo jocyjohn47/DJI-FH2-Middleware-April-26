@@ -109,12 +109,93 @@ async def on_shutdown():
         await redis.aclose()
 
 
+def _as_bool(value: Any, default: bool = True) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return bool(value)
+    s = str(value).strip().lower()
+    if s in ("1", "true", "yes", "on"):
+        return True
+    if s in ("0", "false", "no", "off"):
+        return False
+    return default
+
+
+def _normalize_source_auth_config(
+    cfg: dict | None,
+    existing: dict | None = None,
+) -> dict[str, Any]:
+    """
+    Normalize UI/admin auth payloads into backend-safe source auth config.
+
+    Supported meanings:
+    - enabled=false in UI auth screen  -> auth disabled, but source still enabled
+    - mode=none/off/disabled/no_auth   -> auth disabled, but source still enabled
+    - header_name='no auth'            -> auth disabled, but source still enabled
+    - static token mode                -> require exact header/token match
+
+    Reserved explicit source-disable mode:
+    - mode=source_disabled
+    """
+    existing = existing or {}
+    cfg = dict(cfg or {})
+
+    raw_mode = str(cfg.get("mode") or existing.get("mode") or "").strip().lower()
+    raw_header = str(
+        cfg.get("header_name")
+        or cfg.get("header")
+        or existing.get("header_name")
+        or ""
+    ).strip()
+    raw_token = str(cfg.get("token") or "")
+    enabled_flag = _as_bool(cfg.get("enabled", True), default=True)
+
+    no_auth_aliases = {"none", "no_auth", "no-auth", "off", "disabled", "no auth"}
+    disabled_aliases = {"source_disabled", "disabled_source", "blocked", "block"}
+
+    if raw_mode in disabled_aliases:
+        return {
+            "enabled": False,
+            "mode": "source_disabled",
+            "header_name": "",
+            "token": "",
+        }
+
+    wants_no_auth = (
+        (cfg.get("enabled") is not None and enabled_flag is False)
+        or raw_mode in no_auth_aliases
+        or raw_header.lower() in no_auth_aliases
+    )
+
+    if wants_no_auth:
+        return {
+            "enabled": True,
+            "mode": "none",
+            "header_name": "",
+            "token": "",
+        }
+
+    header_name = raw_header or str(existing.get("header_name") or "X-MW-Token").strip() or "X-MW-Token"
+    token = raw_token or str(existing.get("token") or "")
+
+    return {
+        "enabled": True,
+        "mode": "static_token",
+        "header_name": header_name,
+        "token": token,
+    }
+
+
 def _require_source_auth(source: str, request: Request, srcauth: dict):
     """
     Inbound auth rules:
-    - enabled=false  -> source is disabled completely
-    - mode=none/off/disabled -> allow request without auth header
-    - mode=static_token -> require exact header/token match
+    - enabled=false + mode=source_disabled -> source disabled completely
+    - mode=none/off/disabled/no_auth       -> allow request without auth header
+    - header_name='no auth'                -> treated as no-auth (legacy/UI compatibility)
+    - mode=static_token                    -> require exact header/token match
     """
     if not isinstance(srcauth, dict) or not srcauth:
         raise HTTPException(
@@ -122,17 +203,23 @@ def _require_source_auth(source: str, request: Request, srcauth: dict):
             detail=f"source_not_registered_or_auth_missing: {source}",
         )
 
-    enabled = bool(srcauth.get("enabled", True))
-    if not enabled:
+    enabled = _as_bool(srcauth.get("enabled", True), default=True)
+    mode = str(srcauth.get("mode") or "static_token").strip().lower()
+    header_name = str(srcauth.get("header_name") or "X-MW-Token").strip()
+
+    no_auth_aliases = {"none", "no_auth", "no-auth", "off", "disabled", "no auth"}
+    disabled_aliases = {"source_disabled", "disabled_source", "blocked", "block"}
+
+    if not enabled or mode in disabled_aliases:
         raise HTTPException(
             status_code=403,
             detail=f"source_disabled: {source}",
         )
 
-    mode = str(srcauth.get("mode") or "static_token").lower().strip()
+    if mode in no_auth_aliases:
+        return
 
-    # Allow temporary no-auth mode for vendor/VMS testing
-    if mode in ("none", "disabled", "off"):
+    if header_name.lower() in no_auth_aliases:
         return
 
     if mode != "static_token":
@@ -141,7 +228,6 @@ def _require_source_auth(source: str, request: Request, srcauth: dict):
             detail=f"unsupported_auth_mode: {mode}",
         )
 
-    header_name = str(srcauth.get("header_name") or "X-MW-Token").strip()
     expected = str(srcauth.get("token") or "")
     got = request.headers.get(header_name) or ""
 
@@ -490,18 +576,29 @@ async def source_auth_get(payload: dict[str, Any], x_admin_token: str | None = H
         return {"status": "error", "message": "missing source"}
 
     cfg = await repo.get_source_auth(source)
+    cfg = _normalize_source_auth_config(cfg, existing=cfg if isinstance(cfg, dict) else None)
 
-    # mask token on read
     def mask(v: str):
-        if not v or len(v) < 8:
+        if not v:
+            return ""
+        if len(v) < 8:
             return "****"
         return v[:3] + "****" + v[-3:]
 
-    if isinstance(cfg, dict) and "token" in cfg:
-        cfg = dict(cfg)
-        cfg["token"] = mask(str(cfg.get("token") or ""))
+    ui_cfg = dict(cfg)
 
-    return {"status": "ok", "source": source, "auth": cfg}
+    if ui_cfg.get("mode") == "none":
+        ui_cfg["enabled"] = False
+        ui_cfg["header_name"] = "no auth"
+        ui_cfg["token"] = ""
+    elif ui_cfg.get("mode") == "source_disabled":
+        ui_cfg["enabled"] = False
+        ui_cfg["header_name"] = "disabled"
+        ui_cfg["token"] = ""
+    else:
+        ui_cfg["token"] = mask(str(ui_cfg.get("token") or ""))
+
+    return {"status": "ok", "source": source, "auth": ui_cfg}
 
 
 @app.post("/admin/source/auth/set")
@@ -512,18 +609,27 @@ async def source_auth_set(payload: dict[str, Any], x_admin_token: str | None = H
 
     source = payload.get("source")
     cfg = payload.get("auth")
+
     if not source or cfg is None:
         return {"status": "error", "message": "missing source or auth"}
 
-    # 如果前端未传 token（留空保留原值），从 Redis 读取原 token 合并
-    if isinstance(cfg, dict) and not cfg.get("token"):
-        existing = await repo.get_source_auth(source)
-        if isinstance(existing, dict) and existing.get("token"):
-            cfg = dict(cfg)
-            cfg["token"] = existing["token"]
+    existing = await repo.get_source_auth(source)
+    normalized = _normalize_source_auth_config(
+        cfg,
+        existing=existing if isinstance(existing, dict) else None,
+    )
 
-    await repo.set_source_auth(source, cfg)
-    return {"status": "ok"}
+    await repo.set_source_auth(source, normalized)
+
+    return {
+        "status": "ok",
+        "source": source,
+        "auth": {
+            "enabled": normalized.get("enabled", True),
+            "mode": normalized.get("mode", "static_token"),
+            "header_name": normalized.get("header_name", ""),
+        },
+    }
 
 
 @app.post("/admin/mapping/get")
