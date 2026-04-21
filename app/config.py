@@ -17,7 +17,11 @@ class Settings(BaseSettings):
     STREAM_GROUP: str = "uw-worker-group"
     STREAM_CONSUMER: str = "worker-1"
 
-    ADMIN_TOKEN: str | None = None  # if set, admin endpoints require header X-Admin-Token
+    ADMIN_TOKEN: str | None = None  # legacy support: if set, admin endpoints accept X-Admin-Token directly
+    ADMIN_USERNAME: str = os.environ.get("ADMIN_USERNAME", "admin")
+    ADMIN_PASSWORD: str = os.environ.get("ADMIN_PASSWORD", "")
+    ADMIN_SESSION_SECRET: str = os.environ.get("ADMIN_SESSION_SECRET", "")
+    ADMIN_SESSION_TTL_SECONDS: int = int(os.environ.get("ADMIN_SESSION_TTL_SECONDS", "43200"))
 
     # default source used when webhook request doesn't specify it
     DEFAULT_SOURCE: str = "flighthub2"
