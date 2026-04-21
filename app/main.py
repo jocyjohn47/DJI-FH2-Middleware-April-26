@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
+import json
+import secrets
 import time
 from typing import Any
 
@@ -89,381 +94,142 @@ repo: RedisRepo | None = None
 bus: RedisStreamBus | None = None
 
 
-def _require_admin(x_admin_token: str | None):
-    if settings.ADMIN_TOKEN and x_admin_token != settings.ADMIN_TOKEN:
-        raise PermissionError("admin token invalid")
-
-
-@app.on_event("startup")
-async def on_startup():
-    global redis, repo, bus
-    redis = Redis.from_url(settings.REDIS_URL, decode_responses=True)
-    repo = RedisRepo(redis)
-    bus = RedisStreamBus(redis, settings.STREAM_KEY_RAW)
-
-
-@app.on_event("shutdown")
-async def on_shutdown():
-    global redis
-    if redis:
-        await redis.aclose()
-
-
-def _as_bool(value: Any, default: bool = True) -> bool:
-    if isinstance(value, bool):
-        return value
-    if value is None:
-        return default
-    if isinstance(value, (int, float)):
-        return bool(value)
-    s = str(value).strip().lower()
-    if s in ("1", "true", "yes", "on"):
-        return True
-    if s in ("0", "false", "no", "off"):
-        return False
-    return default
-
-
-def _normalize_source_auth_config(
-    cfg: dict | None,
-    existing: dict | None = None,
-) -> dict[str, Any]:
-    """
-    Normalize UI/admin auth payloads into backend-safe source auth config.
-
-    Supported meanings:
-    - enabled=false in UI auth screen  -> auth disabled, but source still enabled
-    - mode=none/off/disabled/no_auth   -> auth disabled, but source still enabled
-    - header_name='no auth'            -> auth disabled, but source still enabled
-    - static token mode                -> require exact header/token match
-
-    Reserved explicit source-disable mode:
-    - mode=source_disabled
-    """
-    existing = existing or {}
-    cfg = dict(cfg or {})
-
-    raw_mode = str(cfg.get("mode") or existing.get("mode") or "").strip().lower()
-    raw_header = str(
-        cfg.get("header_name")
-        or cfg.get("header")
-        or existing.get("header_name")
-        or ""
-    ).strip()
-    raw_token = str(cfg.get("token") or "")
-    enabled_flag = _as_bool(cfg.get("enabled", True), default=True)
-
-    no_auth_aliases = {"none", "no_auth", "no-auth", "off", "disabled", "no auth"}
-    disabled_aliases = {"source_disabled", "disabled_source", "blocked", "block"}
-
-    if raw_mode in disabled_aliases:
-        return {
-            "enabled": False,
-            "mode": "source_disabled",
-            "header_name": "",
-            "token": "",
-        }
-
-    wants_no_auth = (
-        (cfg.get("enabled") is not None and enabled_flag is False)
-        or raw_mode in no_auth_aliases
-        or raw_header.lower() in no_auth_aliases
+def _admin_signing_secret() -> str:
+    return (
+        settings.ADMIN_SESSION_SECRET
+        or settings.ADMIN_TOKEN
+        or settings.ADMIN_PASSWORD
+        or "change-me-admin-session-secret"
     )
 
-    if wants_no_auth:
+
+def _b64url_encode(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).decode().rstrip("=")
+
+
+def _b64url_decode(data: str) -> bytes:
+    padding = "=" * (-len(data) % 4)
+    return base64.urlsafe_b64decode(data + padding)
+
+
+def _mint_admin_session(username: str) -> str:
+    now = int(time.time())
+    payload = {
+        "sub": username,
+        "role": "admin",
+        "iat": now,
+        "exp": now + int(settings.ADMIN_SESSION_TTL_SECONDS),
+        "jti": secrets.token_urlsafe(12),
+    }
+    payload_json = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode()
+    payload_b64 = _b64url_encode(payload_json)
+    sig = hmac.new(
+        _admin_signing_secret().encode(),
+        payload_b64.encode(),
+        hashlib.sha256,
+    ).digest()
+    sig_b64 = _b64url_encode(sig)
+    return f"{payload_b64}.{sig_b64}"
+
+
+def _verify_admin_session(token: str | None) -> dict[str, Any] | None:
+    if not token or "." not in token:
+        return None
+    try:
+        payload_b64, sig_b64 = token.split(".", 1)
+        expected_sig = hmac.new(
+            _admin_signing_secret().encode(),
+            payload_b64.encode(),
+            hashlib.sha256,
+        ).digest()
+        actual_sig = _b64url_decode(sig_b64)
+        if not hmac.compare_digest(actual_sig, expected_sig):
+            return None
+        payload = json.loads(_b64url_decode(payload_b64).decode())
+        if payload.get("role") != "admin":
+            return None
+        if int(payload.get("exp", 0)) < int(time.time()):
+            return None
+        return payload
+    except Exception:
+        return None
+
+
+def _require_admin(x_admin_token: str | None):
+    if settings.ADMIN_TOKEN and x_admin_token == settings.ADMIN_TOKEN:
+        return {"sub": "legacy-admin", "role": "admin"}
+
+    session = _verify_admin_session(x_admin_token)
+    if session:
+        return session
+
+    raise HTTPException(status_code=401, detail="admin authentication required")
+
+
+def _normalize_vms_type(value: Any) -> str:
+    s = str(value or "custom").strip().lower()
+    aliases = {
+        "hik": "hikvision",
+        "hikcentral": "hikvision",
+        "hcp": "hikvision",
+        "custom": "custom",
+        "generic": "custom",
+    }
+    return aliases.get(s, s)
+
+
+def _default_source_auth_for_vms(vms_type: str) -> dict[str, Any]:
+    vt = _normalize_vms_type(vms_type)
+    if vt == "hikvision":
         return {
             "enabled": True,
             "mode": "none",
             "header_name": "",
             "token": "",
         }
-
-    header_name = raw_header or str(existing.get("header_name") or "X-MW-Token").strip() or "X-MW-Token"
-    token = raw_token or str(existing.get("token") or "")
-
     return {
         "enabled": True,
         "mode": "static_token",
-        "header_name": header_name,
+        "header_name": "X-MW-Token",
+        "token": "",
+    }
+
+
+@app.post("/admin/login")
+async def admin_login(payload: dict[str, Any]):
+    username = str(payload.get("username") or "").strip()
+    password = str(payload.get("password") or "")
+
+    if not settings.ADMIN_USERNAME or not settings.ADMIN_PASSWORD:
+        raise HTTPException(status_code=500, detail="admin username/password not configured")
+    if username != settings.ADMIN_USERNAME or password != settings.ADMIN_PASSWORD:
+        raise HTTPException(status_code=401, detail="invalid username or password")
+
+    token = _mint_admin_session(username)
+    return {
+        "status": "ok",
         "token": token,
+        "user": {"username": username, "role": "admin"},
+        "expires_in": int(settings.ADMIN_SESSION_TTL_SECONDS),
     }
 
 
-def _require_source_auth(source: str, request: Request, srcauth: dict):
-    """
-    Inbound auth rules:
-    - enabled=false + mode=source_disabled -> source disabled completely
-    - mode=none/off/disabled/no_auth       -> allow request without auth header
-    - header_name='no auth'                -> treated as no-auth (legacy/UI compatibility)
-    - mode=static_token                    -> require exact header/token match
-    """
-    if not isinstance(srcauth, dict) or not srcauth:
-        raise HTTPException(
-            status_code=401,
-            detail=f"source_not_registered_or_auth_missing: {source}",
-        )
-
-    enabled = _as_bool(srcauth.get("enabled", True), default=True)
-    mode = str(srcauth.get("mode") or "static_token").strip().lower()
-    header_name = str(srcauth.get("header_name") or "X-MW-Token").strip()
-
-    no_auth_aliases = {"none", "no_auth", "no-auth", "off", "disabled", "no auth"}
-    disabled_aliases = {"source_disabled", "disabled_source", "blocked", "block"}
-
-    if not enabled or mode in disabled_aliases:
-        raise HTTPException(
-            status_code=403,
-            detail=f"source_disabled: {source}",
-        )
-
-    if mode in no_auth_aliases:
-        return
-
-    if header_name.lower() in no_auth_aliases:
-        return
-
-    if mode != "static_token":
-        raise HTTPException(
-            status_code=400,
-            detail=f"unsupported_auth_mode: {mode}",
-        )
-
-    expected = str(srcauth.get("token") or "")
-    got = request.headers.get(header_name) or ""
-
-    if not expected or got != expected:
-        raise HTTPException(status_code=401, detail="auth_failed")
-
-
-def _event_preview(obj: Any) -> dict[str, Any]:
-    if not isinstance(obj, dict):
-        return {"summary": str(obj)[:200]}
-
-    coordinates = obj.get("coordinates")
-    if not isinstance(coordinates, dict):
-        coordinates = {}
-
+@app.get("/admin/me")
+async def admin_me(x_admin_token: str | None = Header(default=None)):
+    session = _require_admin(x_admin_token)
     return {
-        "alert": obj.get("alertLabel") or obj.get("description") or obj.get("desc") or "",
-        "camera": obj.get("camera") or obj.get("creator_id") or obj.get("creator") or "",
-        "latitude": obj.get("latitude") or coordinates.get("lat") or "",
-        "longitude": obj.get("longitude") or coordinates.get("lng") or "",
-    }
-
-
-def _resolve_source(
-    request: Request,
-    payload: dict[str, Any],
-    source_query: str | None = None,
-    source_path: str | None = None,
-) -> str:
-    return (
-        source_path
-        or source_query
-        or payload.get("source")
-        or request.headers.get("x-source")
-        or request.headers.get("x-vms-source")
-        or settings.DEFAULT_SOURCE
-    )
-
-
-def _extract_webhook_event(payload: dict[str, Any]) -> dict[str, Any]:
-    if not isinstance(payload, dict):
-        return {}
-
-    if isinstance(payload.get("webhook_event"), dict):
-        return payload["webhook_event"]
-
-    if isinstance(payload.get("event"), dict):
-        return payload["event"]
-
-    if isinstance(payload.get("payload"), dict):
-        return payload["payload"]
-
-    if isinstance(payload.get("raw"), dict):
-        return payload["raw"]
-
-    return payload
-
-
-def _auth_failed_status(exc: HTTPException) -> str:
-    if exc.status_code in (401, 403):
-        return "auth_failed"
-    return "rejected"
-
-
-async def _handle_webhook_ingest(
-    payload: dict[str, Any],
-    request: Request,
-    source_query: str | None = None,
-    source_path: str | None = None,
-):
-    global bus, repo
-    assert bus is not None
-    assert repo is not None
-
-    src = _resolve_source(
-        request=request,
-        payload=payload,
-        source_query=source_query,
-        source_path=source_path,
-    )
-
-    webhook_event = _extract_webhook_event(payload)
-
-    received_at = int(time.time())
-    preview = _event_preview(webhook_event)
-
-    hdr = {}
-    for k in (
-        "content-type",
-        "user-agent",
-        "x-forwarded-for",
-        "authorization",
-        "x-source",
-        "x-vms-source",
-    ):
-        if k in request.headers:
-            hdr[k] = request.headers.get(k)
-
-    try:
-        srcauth = await repo.get_source_auth(src)
-        _require_source_auth(src, request, srcauth)
-    except HTTPException as exc:
-        await repo.log_recent_event({
-            "ts": received_at,
-            "source": src,
-            "direction": "receive",
-            "stage": "ingress",
-            "status": _auth_failed_status(exc),
-            "http_status": exc.status_code,
-            "preview": preview,
-            "request_headers": hdr,
-            "error": str(exc.detail),
-        })
-        raise
-
-    msg = {
-        "source": src,
-        "received_at": received_at,
-        "request": {
-            "path": str(request.url.path),
-            "method": "POST",
-            "headers": hdr,
+        "status": "ok",
+        "user": {
+            "username": session.get("sub", "admin"),
+            "role": session.get("role", "admin"),
         },
-        "webhook_event": webhook_event,
-    }
-
-    await bus.produce(msg)
-
-    await repo.log_recent_event({
-        "ts": received_at,
-        "source": src,
-        "direction": "receive",
-        "stage": "ingress",
-        "status": "accepted",
-        "http_status": 200,
-        "preview": preview,
-        "request_headers": hdr,
-    })
-
-    return {
-        "status": "accepted",
-        "queue": "redis_stream",
-        "stream": settings.STREAM_KEY_RAW,
-        "source": src,
     }
 
 
-@app.post("/webhook")
-async def webhook_ingest(
-    payload: dict[str, Any],
-    request: Request,
-    source: str | None = Query(default=None),
-):
-    """
-    Generic webhook endpoint.
-
-    Supports:
-    1) Query style:
-       POST /webhook?source=scylla
-
-    2) Body style:
-       {
-         "source": "scylla",
-         "webhook_event": {...}
-       }
-
-    3) Raw vendor body:
-       POST /webhook?source=scylla
-       { ...vendor JSON... }
-
-    4) Source header style:
-       X-Source: scylla
-       or
-       X-VMS-Source: scylla
-    """
-    return await _handle_webhook_ingest(
-        payload=payload,
-        request=request,
-        source_query=source,
-    )
-
-
-@app.post("/webhook/{source_name}")
-async def webhook_ingest_by_path(
-    source_name: str,
-    payload: dict[str, Any],
-    request: Request,
-):
-    """
-    Path-based webhook endpoint for vendor/VMS compatibility.
-
-    Example:
-      POST /webhook/scylla
-    """
-    return await _handle_webhook_ingest(
-        payload=payload,
-        request=request,
-        source_path=source_name,
-    )
-
-
-def _default_mapping() -> dict:
-    return {
-        "mappings": [
-            {"src": "$.timestamp", "dst": "timestamp", "type": "string", "default": "", "required": False},
-            {"src": "$.creator_id", "dst": "creator_id", "type": "string", "default": "system", "required": True},
-            {"src": "$.latitude", "dst": "latitude", "type": "float", "default": 0, "required": True},
-            {"src": "$.longitude", "dst": "longitude", "type": "float", "default": 0, "required": True},
-            {"src": "$.level", "dst": "level", "type": "string", "default": "info", "required": True},
-            {"src": "$.description", "dst": "description", "type": "string", "default": "", "required": False},
-        ]
-    }
-
-
-def _default_fhcfg() -> dict:
-    return {
-        "endpoint": settings.DEFAULT_FLIGHTHUB_ENDPOINT,
-        "headers": {
-            "Content-Type": "application/json",
-            "X-User-Token": "",
-            "x-project-uuid": "",
-        },
-        "template_body": {
-            "workflow_uuid": "",
-            "trigger_type": 0,
-            "name": "Alert-{{timestamp}}",
-            "params": {
-                "creator": "{{creator_id}}",
-                "latitude": "{{latitude}}",
-                "longitude": "{{longitude}}",
-                "level": "{{level}}",
-                "desc": "{{description}}",
-            },
-        },
-        "retry_policy": {"max_retries": 3, "backoff": "exponential"},
-    }
+@app.post("/admin/logout")
+async def admin_logout(x_admin_token: str | None = Header(default=None)):
+    _require_admin(x_admin_token)
+    return {"status": "ok", "message": "delete token client-side to logout"}
 
 
 @app.post("/admin/source/list")
@@ -501,31 +267,37 @@ async def source_init(payload: dict[str, Any], x_admin_token: str | None = Heade
     assert repo is not None
     _require_admin(x_admin_token)
 
-    source = payload.get("source")
+    source = str(payload.get("source") or "").strip()
     if not source:
         return {"status": "error", "message": "missing source"}
 
-    # If already exists, keep as-is unless force=true
+    vms_type = _normalize_vms_type(payload.get("source_type") or payload.get("vms_type") or source)
     force = bool(payload.get("force", False))
 
     existing_map = await repo.get_mapping(source)
     existing_cfg = await repo.get_fhcfg(source)
 
     if (existing_map.get("mappings") or existing_cfg) and not force:
-        return {"status": "ok", "message": "already exists", "source": source}
+        return {"status": "ok", "message": "already exists", "source": source, "source_type": vms_type}
 
-    await repo.set_mapping(source, _default_mapping())
-    await repo.set_fhcfg(source, _default_fhcfg())
+    await repo.set_mapping(source, _default_mapping_for_vms(vms_type))
+    await repo.set_fhcfg(source, _default_fhcfg_for_vms(vms_type))
+    await repo.set_source_auth(source, _default_source_auth_for_vms(vms_type))
 
-    # default inbound auth: disabled until token set
-    await repo.set_source_auth(source, {
-        "enabled": True,
-        "mode": "static_token",
-        "header_name": "X-MW-Token",
-        "token": "",
-    })
+    return {"status": "ok", "message": "initialized", "source": source, "source_type": vms_type}
 
-    return {"status": "ok", "message": "initialized", "source": source}
+
+@app.post("/admin/source/preset")
+async def source_preset(payload: dict[str, Any], x_admin_token: str | None = Header(default=None)):
+    _require_admin(x_admin_token)
+    vms_type = _normalize_vms_type(payload.get("source_type") or payload.get("vms_type") or payload.get("source") or "custom")
+    return {
+        "status": "ok",
+        "source_type": vms_type,
+        "mapping": _default_mapping_for_vms(vms_type),
+        "auth": _default_source_auth_for_vms(vms_type),
+        "config": _default_fhcfg_for_vms(vms_type),
+    }
 
 
 @app.post("/admin/source/delete")
@@ -672,23 +444,7 @@ async def flighthub_get(payload: dict[str, Any], x_admin_token: str | None = Hea
         return {"status": "error", "message": "missing source"}
 
     cfg = await repo.get_fhcfg(source)
-
-    # mask secrets on read
-    def mask(v: str):
-        if not v or len(v) < 8:
-            return "****"
-        return v[:4] + "****" + v[-4:]
-
-    if isinstance(cfg, dict):
-        headers = cfg.get("headers")
-        if isinstance(headers, dict):
-            if "X-User-Token" in headers:
-                headers = dict(headers)
-                headers["X-User-Token"] = mask(str(headers["X-User-Token"]))
-                cfg = dict(cfg)
-                cfg["headers"] = headers
-
-    return {"status": "ok", "source": source, "config": cfg}
+    return {"status": "ok", "source": source, "config": _sanitize_fhcfg_for_ui(cfg)}
 
 
 @app.post("/admin/flighthub/set")
@@ -702,8 +458,10 @@ async def flighthub_set(payload: dict[str, Any], x_admin_token: str | None = Hea
     if not source or cfg is None:
         return {"status": "error", "message": "missing source or config"}
 
-    await repo.set_fhcfg(source, cfg)
-    return {"status": "ok"}
+    existing = await repo.get_fhcfg(source)
+    merged = _merge_fhcfg(existing, cfg)
+    await repo.set_fhcfg(source, merged)
+    return {"status": "ok", "source": source}
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -885,12 +643,15 @@ async def debug_run(payload: dict[str, Any], x_admin_token: str | None = Header(
         # Stage 2 — normalize (adapter)
         adapter_conf = await repo.get_adapter(source)
         normalized = normalize(flat, adapter_conf)
+        received_at = int(_time.time())
+        if _normalize_vms_type(source) == "hikvision":
+            normalized = _inject_hikvision_transform(normalized, raw, received_at)
+            stages["normalized_transformed"] = normalized
         stages["normalized"] = normalized
-        stages["normalized_fields"] = get_normalized_fields(flat, adapter_conf)
+        stages["normalized_fields"] = sorted(k for k, v in normalized.items() if v is not None)
 
         # Stage 3 — mapping
         mapping_conf = mapping_override if mapping_override else await repo.get_mapping(source)
-        received_at = int(_time.time())
         mapped = apply_mappings(raw, source, mapping_conf, received_at, flat_event=normalized)
         stages["mapped"] = mapped
 
