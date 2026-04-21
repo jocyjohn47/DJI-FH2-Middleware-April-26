@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>FlightHub Webhook Transformer</title>
 
-    <!-- Match current built CSS asset -->
+    <!-- Update if Vite asset name changes -->
     <link rel="stylesheet" crossorigin href="/console/assets/index-DZKZ4JKM.css">
 
     <style>
@@ -16,7 +16,6 @@
         background: #f8fafc;
       }
 
-      /* App stays hidden until session is verified */
       #root {
         min-height: 100vh;
         display: none;
@@ -131,7 +130,6 @@
     <script>
       (function () {
         const JS_BUNDLE = '/console/assets/index-BUtqXV6a.js';
-        const TOKEN_KEYS = ['admin_token', 'mw_admin_token'];
         let appLoaded = false;
 
         const overlay = document.getElementById('admin-login-overlay');
@@ -143,37 +141,27 @@
         const passwordInput = document.getElementById('admin-password');
 
         function getToken() {
-          return localStorage.getItem('admin_token')
-            || localStorage.getItem('mw_admin_token')
-            || '';
+          return localStorage.getItem('admin_token') || '';
         }
 
         function setToken(token) {
           localStorage.setItem('admin_token', token);
-          localStorage.setItem('mw_admin_token', token);
+          localStorage.setItem('mw_admin_token', token); // keep backward compatibility
         }
 
         function clearToken() {
-          TOKEN_KEYS.forEach((k) => localStorage.removeItem(k));
-        }
-
-        function sameOriginAdmin(url) {
-          try {
-            const u = new URL(url, window.location.origin);
-            return u.origin === window.location.origin && u.pathname.startsWith('/admin/');
-          } catch (e) {
-            return false;
-          }
+          localStorage.removeItem('admin_token');
+          localStorage.removeItem('mw_admin_token');
         }
 
         function showLogin(message = '') {
           overlay.style.display = 'flex';
           root.style.display = 'none';
-          err.textContent = message || '';
           logoutBtn.style.display = 'none';
+          err.textContent = message;
         }
 
-        function hideLogin() {
+        function showApp() {
           overlay.style.display = 'none';
           err.textContent = '';
           root.style.display = 'block';
@@ -184,97 +172,55 @@
           if (appLoaded) return;
           appLoaded = true;
 
-          const s = document.createElement('script');
-          s.type = 'module';
-          s.crossOrigin = '';
-          s.src = JS_BUNDLE;
-          document.body.appendChild(s);
+          const script = document.createElement('script');
+          script.type = 'module';
+          script.crossOrigin = '';
+          script.src = JS_BUNDLE;
+          document.body.appendChild(script);
         }
 
-        const origFetch = window.fetch.bind(window);
-        window.fetch = async function (input, init) {
-          init = init || {};
-          const url = (typeof input === 'string') ? input : ((input && input.url) || '');
+        async function verifyToken(token) {
+          if (!token) return false;
 
-          if (sameOriginAdmin(url)) {
-            const headers = new Headers(init.headers || (input && input.headers) || {});
-            const token = getToken();
-            if (token) headers.set('X-Admin-Token', token);
-            init.headers = headers;
-          }
-
-          const res = await origFetch(input, init);
-
-          if (sameOriginAdmin(url) && res.status === 401 && getToken()) {
-            clearToken();
-            showLogin('Session expired. Please sign in again.');
-          }
-
-          return res;
-        };
-
-        const origOpen = XMLHttpRequest.prototype.open;
-        const origSend = XMLHttpRequest.prototype.send;
-
-        XMLHttpRequest.prototype.open = function (method, url) {
-          this._mwUrl = url;
-          return origOpen.apply(this, arguments);
-        };
-
-        XMLHttpRequest.prototype.send = function () {
           try {
-            if (sameOriginAdmin(this._mwUrl)) {
-              const token = getToken();
-              if (token) this.setRequestHeader('X-Admin-Token', token);
-            }
-          } catch (e) {}
+            const res = await fetch('/admin/me', {
+              headers: { 'X-Admin-Token': token }
+            });
+            return res.ok;
+          } catch (e) {
+            return false;
+          }
+        }
 
-          this.addEventListener('load', () => {
-            try {
-              if (sameOriginAdmin(this._mwUrl) && this.status === 401 && getToken()) {
-                clearToken();
-                showLogin('Session expired. Please sign in again.');
-              }
-            } catch (e) {}
-          });
-
-          return origSend.apply(this, arguments);
-        };
-
-        async function checkSession() {
+        async function boot() {
           const token = getToken();
 
           if (!token) {
             showLogin('');
-            return false;
+            return;
           }
 
-          try {
-            const res = await origFetch('/admin/me', {
-              headers: { 'X-Admin-Token': token }
-            });
+          const ok = await verifyToken(token);
+          if (!ok) {
+            clearToken();
+            showLogin('');
+            return;
+          }
 
-            if (res.ok) {
-              hideLogin();
-              loadApp();
-              return true;
-            }
-          } catch (e) {}
-
-          clearToken();
-          showLogin('');
-          return false;
+          showApp();
+          loadApp();
         }
 
         async function doLogin() {
           const username = usernameInput.value.trim();
           const password = passwordInput.value;
+
           err.textContent = '';
           loginBtn.disabled = true;
           loginBtn.textContent = 'Signing in...';
 
           try {
-            const res = await origFetch('/admin/login', {
+            const res = await fetch('/admin/login', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({ username, password })
@@ -289,17 +235,14 @@
 
             setToken(data.token);
 
-            const me = await origFetch('/admin/me', {
-              headers: { 'X-Admin-Token': data.token }
-            });
-
-            if (!me.ok) {
+            const ok = await verifyToken(data.token);
+            if (!ok) {
               clearToken();
               showLogin('Login succeeded but session verification failed.');
               return;
             }
 
-            hideLogin();
+            showApp();
             loadApp();
           } catch (e) {
             showLogin('Login request failed');
@@ -317,10 +260,10 @@
 
         logoutBtn.addEventListener('click', function () {
           clearToken();
-          window.location.reload();
+          window.location.href = '/console';
         });
 
-        checkSession();
+        boot();
       })();
     </script>
   </body>
