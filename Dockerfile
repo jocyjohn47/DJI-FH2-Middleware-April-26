@@ -1,5 +1,5 @@
 # ═══════════════════════════════════════════════════════════════════
-# Stage 1 — Python 依赖安装
+# Stage 1 — Python dependencies
 # ═══════════════════════════════════════════════════════════════════
 FROM python:3.12-slim AS py-builder
 
@@ -11,7 +11,7 @@ RUN pip install --upgrade pip --quiet && \
     pip install --prefix=/install -r requirements.txt --quiet
 
 # ═══════════════════════════════════════════════════════════════════
-# Stage 2 — React 前端构建
+# Stage 2 — React frontend build
 #   WORKDIR = /workspace/frontend
 #   vite outDir = ../app/static/console → /workspace/app/static/console
 # ═══════════════════════════════════════════════════════════════════
@@ -19,58 +19,62 @@ FROM node:20-slim AS fe-builder
 
 WORKDIR /workspace/frontend
 
-# 先复制 package 文件（利用 layer cache）
+# Copy package files first for better layer caching
 COPY frontend/package.json frontend/package-lock.json ./
 
-# 使用 npm install 代替 npm ci --prefer-offline，避免缓存丢失报错
+# Install dependencies
 RUN npm install --prefer-offline 2>/dev/null || npm install
 
-# 复制全部前端源码
+# Copy full frontend source
 COPY frontend/ ./
 
-# 确保输出目录存在
+# Make sure output folder exists
 RUN mkdir -p /workspace/app/static/console
 
-# 构建 — vite 将产物写入 /workspace/app/static/console
+# Build frontend
 RUN npm run build
 
-# 验证产物（构建失败则 Docker build 中止）
+# Verify built artifacts
 RUN echo "=== fe-builder: built assets ===" && ls -la /workspace/app/static/console/
 
 # ═══════════════════════════════════════════════════════════════════
-# Stage 3 — 最终运行镜像
+# Stage 3 — Final runtime image
 # ═══════════════════════════════════════════════════════════════════
 FROM python:3.12-slim
 
-# 最小系统依赖
+# Minimal system packages
 RUN apt-get update -qq && \
     apt-get install -y --no-install-recommends curl && \
     rm -rf /var/lib/apt/lists/*
 
-# 从 py-builder 安装 Python 包
+# Copy Python packages from builder
 COPY --from=py-builder /install /usr/local
 
-# 创建运行时目录
+# Runtime folders
 RUN mkdir -p /var/log/supervisor /app/logs
 
 WORKDIR /app
 
-# 复制后端源码（不含 static/console，由 fe-builder 产物覆盖）
+# Copy backend source
 COPY app/     ./app/
 COPY worker/  ./worker/
 COPY scripts/ ./scripts/
 COPY deploy/  ./deploy/
 
-# 从 fe-builder 复制前端产物 → /app/app/static/console/
+# Copy generated frontend build output
 COPY --from=fe-builder /workspace/app/static/console/ ./app/static/console/
 
-# 验证控制台文件
-RUN echo "=== runtime: console assets ===" && ls -la /app/app/static/console/
+# IMPORTANT:
+# Override Vite-generated index.html with custom login-wrapper page
+COPY deploy/console-index.html ./app/static/console/index.html
 
-# 赋予 entrypoint 可执行权限
+# Verify console files
+RUN echo "=== runtime: console assets ===" && ls -la /app/app/static/console/ && \
+    echo "=== runtime: console index preview ===" && sed -n '1,60p' /app/app/static/console/index.html
+
+# Entrypoint permission
 RUN chmod +x /app/deploy/entrypoint.sh
 
-# Railway 动态注入 $PORT（此处仅作文档用途）
 EXPOSE 8000
 
 ENV PYTHONUNBUFFERED=1 \
