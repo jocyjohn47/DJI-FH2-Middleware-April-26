@@ -4,20 +4,21 @@ import base64
 import hashlib
 import hmac
 import json
+import os as _os
 import secrets
 import time
 from typing import Any
 
-from fastapi import FastAPI, Request, Header, Query
-from fastapi import HTTPException
-from fastapi.responses import HTMLResponse
-from starlette.staticfiles import StaticFiles
 import re
+from fastapi import FastAPI, Header, HTTPException, Query, Request
+from fastapi.responses import FileResponse as _FileResponse
+from fastapi.responses import HTMLResponse
 from redis.asyncio import Redis
+from starlette.staticfiles import StaticFiles
 
 from app.config import settings
-from app.redis_repo import RedisRepo
 from app.queue_bus import RedisStreamBus
+from app.redis_repo import RedisRepo
 
 app = FastAPI(title="Universal Webhook Middleware (POC)")
 
@@ -28,9 +29,6 @@ app.mount("/ui", StaticFiles(directory="app/static", html=True), name="ui")
 # ── New React Admin Console ────────────────────────────────────────────────────
 # Built output: app/static/console/  →  served at /console/
 # SPA catch-all: any /console/* path → index.html (client-side routing)
-import os as _os
-from fastapi.responses import FileResponse as _FileResponse
-
 _CONSOLE_DIR = _os.path.join(_os.path.dirname(__file__), "static", "console")
 
 if _os.path.isdir(_CONSOLE_DIR):
@@ -94,13 +92,30 @@ repo: RedisRepo | None = None
 bus: RedisStreamBus | None = None
 
 
+def _cfg(name: str, default: Any = None) -> Any:
+    value = getattr(settings, name, None)
+    if value not in (None, ""):
+        return value
+    env_value = _os.getenv(name)
+    if env_value not in (None, ""):
+        return env_value
+    return default
+
+
 def _admin_signing_secret() -> str:
-    return (
-        settings.ADMIN_SESSION_SECRET
-        or settings.ADMIN_TOKEN
-        or settings.ADMIN_PASSWORD
+    return str(
+        _cfg("ADMIN_SESSION_SECRET")
+        or _cfg("ADMIN_TOKEN")
+        or _cfg("ADMIN_PASSWORD")
         or "change-me-admin-session-secret"
     )
+
+
+def _admin_session_ttl_seconds() -> int:
+    try:
+        return int(_cfg("ADMIN_SESSION_TTL_SECONDS", 43200))
+    except Exception:
+        return 43200
 
 
 def _b64url_encode(data: bytes) -> str:
@@ -118,18 +133,12 @@ def _mint_admin_session(username: str) -> str:
         "sub": username,
         "role": "admin",
         "iat": now,
-        "exp": now + int(settings.ADMIN_SESSION_TTL_SECONDS),
+        "exp": now + _admin_session_ttl_seconds(),
         "jti": secrets.token_urlsafe(12),
     }
-    payload_json = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode()
-    payload_b64 = _b64url_encode(payload_json)
-    sig = hmac.new(
-        _admin_signing_secret().encode(),
-        payload_b64.encode(),
-        hashlib.sha256,
-    ).digest()
-    sig_b64 = _b64url_encode(sig)
-    return f"{payload_b64}.{sig_b64}"
+    payload_b64 = _b64url_encode(json.dumps(payload, separators=(",", ":"), sort_keys=True).encode())
+    sig = hmac.new(_admin_signing_secret().encode(), payload_b64.encode(), hashlib.sha256).digest()
+    return f"{payload_b64}.{_b64url_encode(sig)}"
 
 
 def _verify_admin_session(token: str | None) -> dict[str, Any] | None:
@@ -137,11 +146,7 @@ def _verify_admin_session(token: str | None) -> dict[str, Any] | None:
         return None
     try:
         payload_b64, sig_b64 = token.split(".", 1)
-        expected_sig = hmac.new(
-            _admin_signing_secret().encode(),
-            payload_b64.encode(),
-            hashlib.sha256,
-        ).digest()
+        expected_sig = hmac.new(_admin_signing_secret().encode(), payload_b64.encode(), hashlib.sha256).digest()
         actual_sig = _b64url_decode(sig_b64)
         if not hmac.compare_digest(actual_sig, expected_sig):
             return None
@@ -156,7 +161,8 @@ def _verify_admin_session(token: str | None) -> dict[str, Any] | None:
 
 
 def _require_admin(x_admin_token: str | None):
-    if settings.ADMIN_TOKEN and x_admin_token == settings.ADMIN_TOKEN:
+    legacy_token = str(_cfg("ADMIN_TOKEN") or "")
+    if legacy_token and x_admin_token == legacy_token:
         return {"sub": "legacy-admin", "role": "admin"}
 
     session = _verify_admin_session(x_admin_token)
@@ -195,14 +201,627 @@ def _default_source_auth_for_vms(vms_type: str) -> dict[str, Any]:
     }
 
 
+@app.on_event("startup")
+async def on_startup():
+    global redis, repo, bus
+    redis = Redis.from_url(settings.REDIS_URL, decode_responses=True)
+    repo = RedisRepo(redis)
+    bus = RedisStreamBus(redis, settings.STREAM_KEY_RAW)
+
+
+@app.on_event("shutdown")
+async def on_shutdown():
+    global redis
+    if redis:
+        await redis.aclose()
+
+
+def _as_bool(value: Any, default: bool = True) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return bool(value)
+    s = str(value).strip().lower()
+    if s in ("1", "true", "yes", "on"):
+        return True
+    if s in ("0", "false", "no", "off"):
+        return False
+    return default
+
+
+def _normalize_source_auth_config(
+    cfg: dict | None,
+    existing: dict | None = None,
+) -> dict[str, Any]:
+    """
+    Normalize UI/admin auth payloads into backend-safe source auth config.
+
+    Supported meanings:
+    - enabled=false in UI auth screen  -> auth disabled, but source still enabled
+    - mode=none/off/disabled/no_auth   -> auth disabled, but source still enabled
+    - header_name='no auth'            -> auth disabled, but source still enabled
+    - static token mode                -> require exact header/token match
+
+    Reserved explicit source-disable mode:
+    - mode=source_disabled
+    """
+    existing = existing or {}
+    cfg = dict(cfg or {})
+
+    raw_mode = str(cfg.get("mode") or existing.get("mode") or "").strip().lower()
+    raw_header = str(
+        cfg.get("header_name")
+        or cfg.get("header")
+        or existing.get("header_name")
+        or ""
+    ).strip()
+    raw_token = str(cfg.get("token") or "")
+    enabled_flag = _as_bool(cfg.get("enabled", True), default=True)
+
+    no_auth_aliases = {"none", "no_auth", "no-auth", "off", "disabled", "no auth"}
+    disabled_aliases = {"source_disabled", "disabled_source", "blocked", "block"}
+
+    if raw_mode in disabled_aliases:
+        return {
+            "enabled": False,
+            "mode": "source_disabled",
+            "header_name": "",
+            "token": "",
+        }
+
+    wants_no_auth = (
+        (cfg.get("enabled") is not None and enabled_flag is False)
+        or raw_mode in no_auth_aliases
+        or raw_header.lower() in no_auth_aliases
+    )
+
+    if wants_no_auth:
+        return {
+            "enabled": True,
+            "mode": "none",
+            "header_name": "",
+            "token": "",
+        }
+
+    header_name = raw_header or str(existing.get("header_name") or "X-MW-Token").strip() or "X-MW-Token"
+    token = raw_token or str(existing.get("token") or "")
+
+    return {
+        "enabled": True,
+        "mode": "static_token",
+        "header_name": header_name,
+        "token": token,
+    }
+
+
+def _require_source_auth(source: str, request: Request, srcauth: dict):
+    """
+    Inbound auth rules:
+    - enabled=false + mode=source_disabled -> source disabled completely
+    - mode=none/off/disabled/no_auth       -> allow request without auth header
+    - header_name='no auth'                -> treated as no-auth (legacy/UI compatibility)
+    - mode=static_token                    -> require exact header/token match
+    """
+    if not isinstance(srcauth, dict) or not srcauth:
+        raise HTTPException(
+            status_code=401,
+            detail=f"source_not_registered_or_auth_missing: {source}",
+        )
+
+    enabled = _as_bool(srcauth.get("enabled", True), default=True)
+    mode = str(srcauth.get("mode") or "static_token").strip().lower()
+    header_name = str(srcauth.get("header_name") or "X-MW-Token").strip()
+
+    no_auth_aliases = {"none", "no_auth", "no-auth", "off", "disabled", "no auth"}
+    disabled_aliases = {"source_disabled", "disabled_source", "blocked", "block"}
+
+    if not enabled or mode in disabled_aliases:
+        raise HTTPException(
+            status_code=403,
+            detail=f"source_disabled: {source}",
+        )
+
+    if mode in no_auth_aliases:
+        return
+
+    if header_name.lower() in no_auth_aliases:
+        return
+
+    if mode != "static_token":
+        raise HTTPException(
+            status_code=400,
+            detail=f"unsupported_auth_mode: {mode}",
+        )
+
+    expected = str(srcauth.get("token") or "")
+    got = request.headers.get(header_name) or ""
+
+    if not expected or got != expected:
+        raise HTTPException(status_code=401, detail="auth_failed")
+
+
+def _event_preview(obj: Any) -> dict[str, Any]:
+    if not isinstance(obj, dict):
+        return {"summary": str(obj)[:200]}
+
+    coordinates = obj.get("coordinates")
+    if not isinstance(coordinates, dict):
+        coordinates = {}
+
+    return {
+        "alert": obj.get("alertLabel") or obj.get("description") or obj.get("desc") or "",
+        "camera": obj.get("camera") or obj.get("creator_id") or obj.get("creator") or "",
+        "latitude": obj.get("latitude") or coordinates.get("lat") or "",
+        "longitude": obj.get("longitude") or coordinates.get("lng") or "",
+    }
+
+
+def _resolve_source(
+    request: Request,
+    payload: dict[str, Any],
+    source_query: str | None = None,
+    source_path: str | None = None,
+) -> str:
+    return (
+        source_path
+        or source_query
+        or payload.get("source")
+        or request.headers.get("x-source")
+        or request.headers.get("x-vms-source")
+        or settings.DEFAULT_SOURCE
+    )
+
+
+def _extract_webhook_event(payload: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {}
+
+    if isinstance(payload.get("webhook_event"), dict):
+        return payload["webhook_event"]
+
+    if isinstance(payload.get("event"), dict):
+        return payload["event"]
+
+    if isinstance(payload.get("payload"), dict):
+        return payload["payload"]
+
+    if isinstance(payload.get("raw"), dict):
+        return payload["raw"]
+
+    return payload
+
+
+def _auth_failed_status(exc: HTTPException) -> str:
+    if exc.status_code in (401, 403):
+        return "auth_failed"
+    return "rejected"
+
+
+async def _handle_webhook_ingest(
+    payload: dict[str, Any],
+    request: Request,
+    source_query: str | None = None,
+    source_path: str | None = None,
+):
+    global bus, repo
+    assert bus is not None
+    assert repo is not None
+
+    src = _resolve_source(
+        request=request,
+        payload=payload,
+        source_query=source_query,
+        source_path=source_path,
+    )
+
+    webhook_event = _extract_webhook_event(payload)
+
+    received_at = int(time.time())
+    preview = _event_preview(webhook_event)
+
+    hdr = {}
+    for k in (
+        "content-type",
+        "user-agent",
+        "x-forwarded-for",
+        "authorization",
+        "x-source",
+        "x-vms-source",
+    ):
+        if k in request.headers:
+            hdr[k] = request.headers.get(k)
+
+    try:
+        srcauth = await repo.get_source_auth(src)
+        _require_source_auth(src, request, srcauth)
+    except HTTPException as exc:
+        await repo.log_recent_event({
+            "ts": received_at,
+            "source": src,
+            "direction": "receive",
+            "stage": "ingress",
+            "status": _auth_failed_status(exc),
+            "http_status": exc.status_code,
+            "preview": preview,
+            "request_headers": hdr,
+            "error": str(exc.detail),
+        })
+        raise
+
+    msg = {
+        "source": src,
+        "received_at": received_at,
+        "request": {
+            "path": str(request.url.path),
+            "method": "POST",
+            "headers": hdr,
+        },
+        "webhook_event": webhook_event,
+    }
+
+    await bus.produce(msg)
+
+    await repo.log_recent_event({
+        "ts": received_at,
+        "source": src,
+        "direction": "receive",
+        "stage": "ingress",
+        "status": "accepted",
+        "http_status": 200,
+        "preview": preview,
+        "request_headers": hdr,
+    })
+
+    return {
+        "status": "accepted",
+        "queue": "redis_stream",
+        "stream": settings.STREAM_KEY_RAW,
+        "source": src,
+    }
+
+
+@app.post("/webhook")
+async def webhook_ingest(
+    payload: dict[str, Any],
+    request: Request,
+    source: str | None = Query(default=None),
+):
+    """
+    Generic webhook endpoint.
+
+    Supports:
+    1) Query style:
+       POST /webhook?source=scylla
+
+    2) Body style:
+       {
+         "source": "scylla",
+         "webhook_event": {...}
+       }
+
+    3) Raw vendor body:
+       POST /webhook?source=scylla
+       { ...vendor JSON... }
+
+    4) Source header style:
+       X-Source: scylla
+       or
+       X-VMS-Source: scylla
+    """
+    return await _handle_webhook_ingest(
+        payload=payload,
+        request=request,
+        source_query=source,
+    )
+
+
+@app.post("/webhook/{source_name}")
+async def webhook_ingest_by_path(
+    source_name: str,
+    payload: dict[str, Any],
+    request: Request,
+):
+    """
+    Path-based webhook endpoint for vendor/VMS compatibility.
+
+    Example:
+      POST /webhook/scylla
+    """
+    return await _handle_webhook_ingest(
+        payload=payload,
+        request=request,
+        source_path=source_name,
+    )
+
+
+def _default_mapping() -> dict:
+    return {
+        "mappings": [
+            {"src": "$.timestamp", "dst": "timestamp", "type": "string", "default": "", "required": False},
+            {"src": "$.creator_id", "dst": "creator_id", "type": "string", "default": "system", "required": True},
+            {"src": "$.latitude", "dst": "latitude", "type": "float", "default": 0, "required": True},
+            {"src": "$.longitude", "dst": "longitude", "type": "float", "default": 0, "required": True},
+            {"src": "$.level", "dst": "level", "type": "int", "default": 3, "required": True},
+            {"src": "$.description", "dst": "description", "type": "string", "default": "", "required": False},
+            {"src": "$.name", "dst": "name", "type": "string", "default": "", "required": False},
+            {"src": "$.params.creator", "dst": "params.creator", "type": "string", "default": "", "required": False},
+            {"src": "$.params.latitude", "dst": "params.latitude", "type": "float", "default": 0, "required": False},
+            {"src": "$.params.longitude", "dst": "params.longitude", "type": "float", "default": 0, "required": False},
+            {"src": "$.params.level", "dst": "params.level", "type": "int", "default": 3, "required": False},
+            {"src": "$.params.desc", "dst": "params.desc", "type": "string", "default": "", "required": False},
+        ]
+    }
+
+
+def _default_mapping_for_vms(vms_type: str) -> dict:
+    _ = _normalize_vms_type(vms_type)
+    return _default_mapping()
+
+
+def _default_fhcfg() -> dict:
+    return {
+        "endpoint": settings.DEFAULT_FLIGHTHUB_ENDPOINT,
+        "headers": {
+            "Content-Type": "application/json",
+            "X-User-Token": "",
+            "x-project-uuid": "",
+        },
+        "template_body": {
+            "workflow_uuid": "",
+            "trigger_type": 0,
+            "name": "{{creator_id}} | {{timestamp}}",
+            "params": {
+                "creator": "{{creator_id}}",
+                "latitude": "{{latitude}}",
+                "longitude": "{{longitude}}",
+                "level": "{{level}}",
+                "desc": "{{description}}",
+            },
+        },
+        "retry_policy": {"max_retries": 3, "backoff": "exponential"},
+    }
+
+
+def _default_fhcfg_for_vms(vms_type: str) -> dict:
+    _ = _normalize_vms_type(vms_type)
+    return _default_fhcfg()
+
+
+def _is_meaningful_value(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        s = value.strip()
+        if s == "" or s == "****":
+            return False
+    return True
+
+
+def _looks_masked(value: Any) -> bool:
+    return isinstance(value, str) and "****" in value
+
+
+def _mask_secret(value: str) -> str:
+    if not value:
+        return ""
+    if len(value) < 8:
+        return "****"
+    return value[:4] + "****" + value[-4:]
+
+
+def _merge_fhcfg(existing: dict | None, incoming: dict | None) -> dict:
+    merged: dict[str, Any] = _default_fhcfg()
+
+    def merge_into(dst: dict[str, Any], src_cfg: dict[str, Any] | None):
+        if not isinstance(src_cfg, dict):
+            return
+
+        if _is_meaningful_value(src_cfg.get("endpoint")):
+            dst["endpoint"] = src_cfg["endpoint"]
+
+        src_headers = src_cfg.get("headers")
+        if isinstance(src_headers, dict):
+            dst_headers = dict(dst.get("headers") or {})
+            for hk, hv in src_headers.items():
+                if not _is_meaningful_value(hv):
+                    continue
+                if _looks_masked(hv):
+                    continue
+                dst_headers[hk] = hv
+            dst["headers"] = dst_headers
+
+        src_template = src_cfg.get("template_body")
+        if isinstance(src_template, dict):
+            dst_template = dict(dst.get("template_body") or {})
+            for tk, tv in src_template.items():
+                if tk == "params" and isinstance(tv, dict):
+                    dst_params = dict(dst_template.get("params") or {})
+                    for pk, pv in tv.items():
+                        if not _is_meaningful_value(pv):
+                            continue
+                        if _looks_masked(pv):
+                            continue
+                        dst_params[pk] = pv
+                    dst_template["params"] = dst_params
+                else:
+                    if not _is_meaningful_value(tv):
+                        continue
+                    if _looks_masked(tv):
+                        continue
+                    dst_template[tk] = tv
+            dst["template_body"] = dst_template
+
+        src_retry = src_cfg.get("retry_policy")
+        if isinstance(src_retry, dict):
+            dst_retry = dict(dst.get("retry_policy") or {})
+            for rk, rv in src_retry.items():
+                if _is_meaningful_value(rv):
+                    dst_retry[rk] = rv
+            dst["retry_policy"] = dst_retry
+
+        src_autofill = src_cfg.get("autofill")
+        if isinstance(src_autofill, dict):
+            dst_autofill = dict(dst.get("autofill") or {})
+            for ak, av in src_autofill.items():
+                if _is_meaningful_value(av):
+                    dst_autofill[ak] = av
+            if dst_autofill:
+                dst["autofill"] = dst_autofill
+
+    merge_into(merged, existing if isinstance(existing, dict) else None)
+    merge_into(merged, incoming if isinstance(incoming, dict) else None)
+    return merged
+
+
+def _sanitize_fhcfg_for_ui(cfg: dict | None) -> dict:
+    merged = _merge_fhcfg(None, cfg if isinstance(cfg, dict) else {})
+    headers = dict(merged.get("headers") or {})
+    token = str(headers.get("X-User-Token") or "")
+    headers["X-User-Token"] = _mask_secret(token) if token else ""
+    merged["headers"] = headers
+    merged["token_already_set"] = bool(token)
+    merged["project_uuid_already_set"] = bool(headers.get("x-project-uuid"))
+    template_body = merged.get("template_body") if isinstance(merged.get("template_body"), dict) else {}
+    merged["workflow_uuid_already_set"] = bool(template_body.get("workflow_uuid"))
+    return merged
+
+
+def _get_nested_value(obj: Any, dotted_key: str) -> Any:
+    cur = obj
+    for part in str(dotted_key).split('.'):
+        if isinstance(cur, dict) and part in cur:
+            cur = cur[part]
+        else:
+            return None
+    return cur
+
+
+def _pick_first(obj: Any, keys: list[str]) -> Any:
+    for key in keys:
+        val = _get_nested_value(obj, key)
+        if val is None:
+            continue
+        if isinstance(val, str) and not val.strip():
+            continue
+        return val
+    return None
+
+
+def _to_float_safe(value: Any, default: float = 0.0) -> float:
+    if value in (None, ""):
+        return default
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+
+def _fh2_level(value: Any, default: int = 3) -> int:
+    if value in (None, ""):
+        return default
+    try:
+        iv = int(value)
+        return max(1, min(5, iv))
+    except Exception:
+        pass
+
+    s = str(value).strip().lower()
+    mapping = {
+        "critical": 5,
+        "emergency": 5,
+        "error": 4,
+        "high": 4,
+        "warning": 3,
+        "warn": 3,
+        "medium": 3,
+        "info": 2,
+        "low": 1,
+        "debug": 1,
+    }
+    return mapping.get(s, default)
+
+
+def _inject_hikvision_transform(normalized: dict[str, Any] | None, raw: dict[str, Any] | None, received_at: int) -> dict[str, Any]:
+    out = dict(normalized or {})
+    raw = raw if isinstance(raw, dict) else {}
+
+    camera = _pick_first(out, [
+        "alarm_source_name", "camera_name", "camera", "device_name", "deviceName",
+        "source_name", "src_name", "channel_name", "cameraName"
+    ]) or _pick_first(raw, [
+        "alarm_source_name", "camera_name", "camera", "device_name", "deviceName",
+        "source_name", "src_name", "channel_name", "cameraName"
+    ]) or "Hikvision"
+
+    event_name = _pick_first(out, [
+        "event_type_name", "event_name", "eventTypeName", "event_type", "alarm_type",
+        "alarm_name", "rule_name", "ruleName", "event"
+    ]) or _pick_first(raw, [
+        "event_type_name", "event_name", "eventTypeName", "event_type", "alarm_type",
+        "alarm_name", "rule_name", "ruleName", "event"
+    ]) or "Alarm"
+
+    timestamp_value = _pick_first(out, [
+        "timestamp", "event_time", "eventTime", "alarm_time", "alarmTime",
+        "start_time", "occur_time", "occurTime", "time"
+    ]) or _pick_first(raw, [
+        "timestamp", "event_time", "eventTime", "alarm_time", "alarmTime",
+        "start_time", "occur_time", "occurTime", "time"
+    ])
+    if timestamp_value in (None, ""):
+        timestamp_value = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(received_at))
+    timestamp = str(timestamp_value)
+
+    latitude = _to_float_safe(
+        _pick_first(out, ["latitude", "lat", "gps.lat", "coordinates.lat"])
+        or _pick_first(raw, ["latitude", "lat", "gps.lat", "coordinates.lat"]),
+        0.0,
+    )
+    longitude = _to_float_safe(
+        _pick_first(out, ["longitude", "lng", "lon", "gps.lng", "gps.lon", "coordinates.lng", "coordinates.lon"])
+        or _pick_first(raw, ["longitude", "lng", "lon", "gps.lng", "gps.lon", "coordinates.lng", "coordinates.lon"]),
+        0.0,
+    )
+    level = _fh2_level(
+        _pick_first(out, ["level", "severity", "event_level", "alarm_level"])
+        or _pick_first(raw, ["level", "severity", "event_level", "alarm_level"]),
+        3,
+    )
+
+    description = str(
+        _pick_first(out, ["description", "desc", "message", "alertLabel"])
+        or _pick_first(raw, ["description", "desc", "message", "alertLabel"])
+        or f"Camera: {camera} | Event: {event_name} | Time: {timestamp}"
+    )
+
+    out["creator_id"] = str(camera)
+    out["timestamp"] = timestamp
+    out["latitude"] = latitude
+    out["longitude"] = longitude
+    out["level"] = level
+    out["description"] = description
+    out["name"] = f"{camera} | {timestamp}"
+    out["params.creator"] = str(camera)
+    out["params.latitude"] = latitude
+    out["params.longitude"] = longitude
+    out["params.level"] = level
+    out["params.desc"] = description
+    return out
+
+
 @app.post("/admin/login")
 async def admin_login(payload: dict[str, Any]):
     username = str(payload.get("username") or "").strip()
     password = str(payload.get("password") or "")
 
-    if not settings.ADMIN_USERNAME or not settings.ADMIN_PASSWORD:
+    admin_username = str(_cfg("ADMIN_USERNAME", "admin") or "admin")
+    admin_password = str(_cfg("ADMIN_PASSWORD", "") or "")
+
+    if not admin_password:
         raise HTTPException(status_code=500, detail="admin username/password not configured")
-    if username != settings.ADMIN_USERNAME or password != settings.ADMIN_PASSWORD:
+    if username != admin_username or password != admin_password:
         raise HTTPException(status_code=401, detail="invalid username or password")
 
     token = _mint_admin_session(username)
@@ -210,7 +829,7 @@ async def admin_login(payload: dict[str, Any]):
         "status": "ok",
         "token": token,
         "user": {"username": username, "role": "admin"},
-        "expires_in": int(settings.ADMIN_SESSION_TTL_SECONDS),
+        "expires_in": _admin_session_ttl_seconds(),
     }
 
 
@@ -644,11 +1263,13 @@ async def debug_run(payload: dict[str, Any], x_admin_token: str | None = Header(
         adapter_conf = await repo.get_adapter(source)
         normalized = normalize(flat, adapter_conf)
         received_at = int(_time.time())
+        stages["normalized_fields"] = get_normalized_fields(flat, adapter_conf)
+
         if _normalize_vms_type(source) == "hikvision":
             normalized = _inject_hikvision_transform(normalized, raw, received_at)
             stages["normalized_transformed"] = normalized
+
         stages["normalized"] = normalized
-        stages["normalized_fields"] = sorted(k for k, v in normalized.items() if v is not None)
 
         # Stage 3 — mapping
         mapping_conf = mapping_override if mapping_override else await repo.get_mapping(source)
