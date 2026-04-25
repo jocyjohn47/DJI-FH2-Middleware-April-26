@@ -28,11 +28,8 @@ RUN npm install --prefer-offline 2>/dev/null || npm install
 # Copy full frontend source
 COPY frontend/ ./
 
-# Make sure output folder exists
-RUN mkdir -p /workspace/app/static/console
-
-# Build frontend
-RUN npm run build
+# Clean old frontend output completely, then build fresh
+RUN rm -rf /workspace/app/static/console && npm run build
 
 # Verify built artifacts
 RUN echo "=== fe-builder: built assets ===" && ls -la /workspace/app/static/console/
@@ -64,13 +61,22 @@ COPY deploy/  ./deploy/
 # Copy generated frontend build output
 COPY --from=fe-builder /workspace/app/static/console/ ./app/static/console/
 
-# IMPORTANT:
 # Override Vite-generated index.html with custom login-wrapper page
 COPY deploy/console-index.html ./app/static/console/index.html
 
-# Verify console files
-RUN echo "=== runtime: console assets ===" && ls -la /app/app/static/console/ && \
-    echo "=== runtime: console index preview ===" && sed -n '1,60p' /app/app/static/console/index.html
+# Inject actual bundle names into wrapper and verify recent logs UI exists
+RUN css=$(find /app/app/static/console/assets -maxdepth 1 -type f -name 'index-*.css' | head -n 1 | sed 's#^/app/app/static/console##') && \
+    js=$(find /app/app/static/console/assets -maxdepth 1 -type f -name 'index-*.js' | head -n 1 | sed 's#^/app/app/static/console##') && \
+    echo "Using CSS asset: $css" && \
+    echo "Using JS asset: $js" && \
+    test -n "$css" && test -n "$js" && \
+    sed -i "s#__CSS_BUNDLE__#$css#g" /app/app/static/console/index.html && \
+    sed -i "s#__JS_BUNDLE__#$js#g" /app/app/static/console/index.html && \
+    echo "=== verify built frontend contains recent logs UI ===" && \
+    grep -R "/admin/events/recent" /app/app/static/console/assets || (echo "ERROR: built bundle missing /admin/events/recent" && exit 1) && \
+    grep -R "Recent Logs" /app/app/static/console/assets || (echo "ERROR: built bundle missing Recent Logs UI" && exit 1) && \
+    echo "=== runtime: console assets ===" && ls -la /app/app/static/console/ && \
+    echo "=== runtime: console index preview ===" && sed -n '1,80p' /app/app/static/console/index.html
 
 # Entrypoint permission
 RUN chmod +x /app/deploy/entrypoint.sh
