@@ -376,7 +376,7 @@ export function Dashboard() {
 
   const { data: recentLogs = [], isFetching: logsRefreshing } = useQuery({
     queryKey: ['recent-logs'],
-    queryFn: () => eventsService.recent('', 100),
+    queryFn: () => eventsService.recent('', 20),
     refetchInterval: 3000,
   })
 
