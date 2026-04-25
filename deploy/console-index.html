@@ -5,8 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>FlightHub Webhook Transformer</title>
 
-    <!-- Update if Vite asset name changes -->
-    <link rel="stylesheet" crossorigin href="/console/assets/index-DZKZ4JKM.css">
+    <link rel="stylesheet" crossorigin href="__CSS_BUNDLE__">
 
     <style>
       html, body {
@@ -129,7 +128,7 @@
 
     <script>
       (function () {
-        const JS_BUNDLE = '/console/assets/index-BUtqXV6a.js';
+        const JS_BUNDLE = '__JS_BUNDLE__';
         let appLoaded = false;
 
         const overlay = document.getElementById('admin-login-overlay');
@@ -146,7 +145,7 @@
 
         function setToken(token) {
           localStorage.setItem('admin_token', token);
-          localStorage.setItem('mw_admin_token', token); // keep backward compatibility
+          localStorage.setItem('mw_admin_token', token);
         }
 
         function clearToken() {
